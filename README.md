@@ -49,7 +49,7 @@ Dragon bones     2,650    2,789       83  3.1%  11000  3,120  780   64.7k   2m
 
 - **Buy**: place your buy offer at this price (the current instant-sell price).
 - **Sell**: place your sell offer at this price (the current instant-buy price).
-- **Margin**: `Sell − tax − Buy`. Tax is 2% of the sell price, floored, capped at 5m, zero under 50 gp, zero for bonds/tools.
+- **Margin**: `Sell − tax − Buy`. Tax is 2% of the sell price, rounded down (so < 50 gp is untaxed), capped at 5m per item; bonds, energy potions, bronze/iron/steel arrows & darts, mind runes, low-level food, basic teleport tablets/jewellery and skilling tools are [exempt](https://oldschool.runescape.wiki/w/Grand_Exchange#Exempt_from_tax).
 - **Qty**: `min(buy limit, budget / Buy, Vol/h ÷ 4)`; assumes you capture at most a quarter of an hour's volume.
 - **Profit**: `Margin × Qty` for one 4-hour buy-limit cycle.
 - **Age**: time since the older of the two prices; stale prices are scored down.

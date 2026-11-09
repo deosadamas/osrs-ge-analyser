@@ -9,14 +9,53 @@ from typing import Any, Iterable
 
 from .api import ItemInfo, LatestPrice, WindowPrice
 
-# Grand Exchange tax: 2% of sell price, floored, capped at 5M per item sold.
-# Sales under 50 gp are untaxed. A fixed set of items is exempt.
+# Grand Exchange tax (since 29 May 2025): 2% of sell price, rounded down, capped at
+# 5M per item sold. Rounding down means sales under 50 gp pay nothing.
+# Exempt list per https://oldschool.runescape.wiki/w/Grand_Exchange#Exempt_from_tax
 TAX_RATE = 0.02
 TAX_CAP = 5_000_000
-TAX_FREE_BELOW = 50
 TAX_EXEMPT_NAMES = frozenset(
     {
         "Old school bond",
+        # Energy potions
+        "Energy potion(1)",
+        "Energy potion(2)",
+        "Energy potion(3)",
+        "Energy potion(4)",
+        # Low level combat consumables
+        "Bronze arrow",
+        "Bronze dart",
+        "Iron arrow",
+        "Iron dart",
+        "Mind rune",
+        "Steel arrow",
+        "Steel dart",
+        # Low level food
+        "Bass",
+        "Bread",
+        "Cake",
+        "Cooked chicken",
+        "Cooked meat",
+        "Herring",
+        "Lobster",
+        "Mackerel",
+        "Meat pie",
+        "Pike",
+        "Salmon",
+        "Shrimps",
+        "Tuna",
+        # Teleport items
+        "Ardougne teleport (tablet)",
+        "Camelot teleport (tablet)",
+        "Civitas illa fortis teleport",
+        "Falador teleport (tablet)",
+        "Games necklace(8)",
+        "Kourend castle teleport (tablet)",
+        "Lumbridge teleport (tablet)",
+        "Ring of dueling(8)",
+        "Teleport to house (tablet)",
+        "Varrock teleport (tablet)",
+        # Tools
         "Chisel",
         "Gardening trowel",
         "Glassblowing pipe",
@@ -35,7 +74,7 @@ TAX_EXEMPT_NAMES = frozenset(
 
 
 def ge_tax(sell_price: int, item_name: str = "") -> int:
-    if item_name in TAX_EXEMPT_NAMES or sell_price < TAX_FREE_BELOW:
+    if item_name in TAX_EXEMPT_NAMES:
         return 0
     return min(math.floor(sell_price * TAX_RATE), TAX_CAP)
 

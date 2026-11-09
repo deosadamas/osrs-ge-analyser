@@ -19,6 +19,8 @@ def test_tax_rules():
     assert ge_tax(1_000_000) == 20_000
     assert ge_tax(1_000_000_000) == TAX_CAP
     assert ge_tax(10_000_000, "Old school bond") == 0
+    assert ge_tax(12_000, "Varrock teleport (tablet)") == 0
+    assert ge_tax(12_000, "Varrock teleport") == 240  # non-tablet names are not exempt
 
 
 def test_margin_is_after_tax():
