@@ -20,6 +20,7 @@ class Purchase:
     item_id: int
     qty: int
     ts: int
+    source: str = "manual"  # "manual" (bought command) or "runelite:<account>"
 
 
 def default_path() -> Path:
@@ -35,12 +36,12 @@ class Ledger:
         self._rows: list[Purchase] = []
         if self.path.exists():
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            self._rows = [Purchase(int(r["item_id"]), int(r["qty"]), int(r["ts"])) for r in raw]
+            self._rows = [Purchase(int(r["item_id"]), int(r["qty"]), int(r["ts"]), r.get("source", "manual")) for r in raw]
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
-            json.dumps([{"item_id": p.item_id, "qty": p.qty, "ts": p.ts} for p in self._rows]),
+            json.dumps([{"item_id": p.item_id, "qty": p.qty, "ts": p.ts, "source": p.source} for p in self._rows]),
             encoding="utf-8",
         )
 
@@ -48,11 +49,20 @@ class Ledger:
         cutoff = now - LIMIT_WINDOW_S
         return [p for p in self._rows if p.ts > cutoff]
 
-    def record(self, item_id: int, qty: int, now: int) -> None:
+    def record(self, item_id: int, qty: int, now: int, source: str = "manual") -> None:
         """Record a purchase; drops rows that have already left the 4h window."""
         self._rows = self.active(now)
-        self._rows.append(Purchase(item_id, qty, now))
+        self._rows.append(Purchase(item_id, qty, now, source))
         self._save()
+
+    def replace_source(self, source: str, rows: list[Purchase], now: int) -> int:
+        """Idempotent bulk import: drop every row from `source`, then add `rows` still in window."""
+        kept = [p for p in self.active(now) if p.source != source]
+        fresh = [p for p in rows if p.ts > now - LIMIT_WINDOW_S]
+        self._rows = kept + fresh
+        self._rows.sort(key=lambda p: p.ts)
+        self._save()
+        return len(fresh)
 
     def used(self, now: int) -> dict[int, int]:
         """Units bought per item within the current 4h window."""

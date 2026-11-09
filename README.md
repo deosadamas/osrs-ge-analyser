@@ -13,6 +13,7 @@ Five commands:
 | `dips`  | Scans the most liquid items and flags ones trading ≥ N standard deviations below their 24h mean (mean-reversion buys). |
 | `bought` | Records what you've bought so remaining 4-hour buy limits are honoured by `flips` and `item`. |
 | `simulate` | Paper-trading agent: runs the ranking on a schedule, places simulated offers, fills them against real later prices. Live loop or 24h+ backtest. |
+| `sync` | Imports your real trades from RuneLite's Flipping Utilities: fills the buy-limit ledger, reports FIFO P&L and fill times, calibrates the simulator's fill model. |
 
 No third-party dependencies; Python 3.10+.
 
@@ -110,6 +111,37 @@ and a meaningless +31,000% with `--loose`. Treat the default as a floor-ish esti
 and `--loose` as a ceiling nobody reaches.
 
 State lives in `~/.osrs-ge-analyser/sim.json` (override with `GE_ANALYSER_SIM`).
+
+## Syncing real trades from RuneLite
+
+Install **Flipping Utilities** from the RuneLite Plugin Hub. It records every GE offer on
+your account (no automation; it only reads game state) to
+`~/.runelite/flipping/<DisplayName>.json`. Then:
+
+```sh
+ge-analyser sync                 # all accounts in ~/.runelite/flipping
+ge-analyser sync path/to/Acc.json --days 30
+ge-analyser sync --calibrate     # also compare each fill with the wiki print at that time
+```
+
+What it does:
+
+1. **Buy limits** — every real purchase in the last 4 h goes into the ledger (tagged per
+   account, idempotent; manual `bought` entries are kept), so `flips`/`item` show your
+   true remaining limits with zero bookkeeping.
+2. **P&L report** — FIFO-matched realised profit per item after the 2% tax, units
+   bought/sold, unsold inventory, median time-to-fill for buys and sells, and how full
+   cancelled offers were when you pulled them.
+3. **Calibration** (`--calibrate`) — for each completed fill, fetches the wiki price at
+   that moment and asks: did you pay *below* the instant-sell / receive *above* the
+   instant-buy (the market had to cross you — a "strict" fill), or were you at/above the
+   print (a "loose" fill)? The share of strict fills tells you which `simulate` fill model
+   matches your account, and the median edge tells you how much better than the instant
+   price your offers actually did.
+
+The schema is taken from the plugin's source (Gson field names `b`, `id`, `cQIT`, `p`,
+`t`, `st`, `tSFO` …). It was verified against a synthetic file, not a real export — if a
+real file fails to parse, open an issue with the file attached.
 
 ## How ranking works
 

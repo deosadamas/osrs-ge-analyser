@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -24,7 +25,9 @@ from .analysis import (
     trend_from_timeseries,
 )
 from .api import GEClient, ItemInfo
-from .ledger import Ledger
+from .calibrate import calibrate, fifo_pnl, fill_stats, step_for_age
+from .ledger import Ledger, Purchase
+from . import runelite
 from .sim import (
     Config,
     Simulator,
@@ -380,6 +383,91 @@ def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemI
         print(_table(["Item", "Profit"], [[n, f"{p:+,}"] for n, p in ranked], right={1}))
 
 
+def _fmt_secs(s: float | None) -> str:
+    if s is None:
+        return "-"
+    return f"{s:.0f}s" if s < 90 else f"{s / 60:.1f}m" if s < 5400 else f"{s / 3600:.1f}h"
+
+
+def cmd_sync(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
+    now = int(time.time())
+    paths: list[Path] = []
+    for p in args.paths:
+        path = Path(p).expanduser()
+        if path.is_dir():
+            paths.extend(runelite.account_files(path))
+        elif path.is_file():
+            paths.append(path)
+        else:
+            sys.exit(f"Not found: {path}")
+    if not args.paths:
+        paths = runelite.account_files()
+    if not paths:
+        sys.exit(
+            f"No Flipping Utilities data in {runelite.default_dir()}. Install 'Flipping Utilities' from the RuneLite "
+            "Plugin Hub, do some GE trades, then re-run; or pass an account .json path explicitly."
+        )
+    trades = runelite.load_trades(paths)
+    accounts = sorted({t.account for t in trades})
+    print(f"Loaded {len(trades)} trade events from {len(paths)} file(s): {', '.join(accounts) or '-'}")
+    if not trades:
+        return
+
+    # 1. Buy-limit ledger: every buy event (complete, partial or cancelled-after-partial-fill)
+    #    counts the units it actually bought against the 4h limit.
+    if not args.no_ledger:
+        total = 0
+        for account in accounts:
+            rows = [Purchase(t.item_id, t.qty, t.ts, f"runelite:{account}") for t in trades if t.account == account and t.buy]
+            total += ledger.replace_source(f"runelite:{account}", rows, now)
+        print(f"Ledger: {total} purchase(s) inside the current 4h window imported (manual entries kept).")
+
+    # 2. Report window.
+    since = now - int(args.days * 86400)
+    window = [t for t in trades if t.ts >= since]
+    completed = [t for t in window if t.state in ("BOUGHT", "SOLD")]
+    print(f"\nLast {args.days:g} day(s): {len(window)} events, {len(completed)} completed offers")
+
+    pnl = fifo_pnl(window)
+    rows = sorted(pnl.values(), key=lambda p: p.realised, reverse=True)
+    if rows:
+        print(
+            _table(
+                ["Item", "Bought", "Sold", "Spent", "Received", "Tax", "Realised", "Unsold"],
+                [
+                    [p.name, f"{p.bought:,}", f"{p.sold:,}", fmt_gp(p.spent), fmt_gp(p.received), fmt_gp(p.tax), f"{p.realised:+,}", f"{p.unmatched_qty:,}"]
+                    for p in rows
+                ],
+                right={1, 2, 3, 4, 5, 6, 7},
+            )
+        )
+        print(f"Total realised: {sum(p.realised for p in rows):+,} gp   tax paid: {fmt_gp(sum(p.tax for p in rows))}")
+
+    fs = fill_stats(window)
+    print(
+        f"\nFills: {fs.completed_buys} buys (median {_fmt_secs(fs.median(fs.buy_fill_seconds))}), "
+        f"{fs.completed_sells} sells (median {_fmt_secs(fs.median(fs.sell_fill_seconds))}); "
+        f"cancelled {fs.cancelled_buys} buys / {fs.cancelled_sells} sells"
+        + (f", cancelled offers were {statistics.mean(fs.cancelled_fill_ratio) * 100:.0f}% filled on average" if fs.cancelled_fill_ratio else "")
+    )
+
+    # 3. Calibration against the wiki print.
+    if args.calibrate:
+        items = sorted({(t.item_id, step_for_age(now - t.ts)) for t in completed})
+        distinct = {i for i, _ in items}
+        if len(distinct) > args.max_items:
+            keep = set(sorted(distinct, key=lambda i: -sum(t.qty * t.price for t in completed if t.item_id == i))[: args.max_items])
+            items = [(i, s) for i, s in items if i in keep]
+        history = {(i, s): client.timeseries(i, s) for i, s in items}
+        c = calibrate(completed, history, now)
+        print(f"\nCalibration: {c.classified} fills classified, {c.unknown} without a wiki print")
+        if c.classified:
+            print(f"  needed the market to cross your price: {c.strict_fills} ({c.strict_share * 100:.0f}%)   at/above the print: {c.loose_fills}")
+            print(f"  median edge vs print: {statistics.median(c.edge_pct):+.2f}%  (positive = better than the instant price)")
+        print(f"  -> {c.suggestion()}")
+
+
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ge-analyser", description="OSRS Grand Exchange flip & trend analyser")
@@ -437,6 +525,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--status", action="store_true", help="show the live simulation portfolio and exit")
     s.add_argument("--reset", action="store_true", help="delete the live simulation state")
     s.set_defaults(func=cmd_simulate)
+
+    y = sub.add_parser("sync", help="import real trades from RuneLite Flipping Utilities: buy limits, P&L, fill times, model calibration")
+    y.add_argument("paths", nargs="*", help="account .json files or directories (default ~/.runelite/flipping)")
+    y.add_argument("--days", type=float, default=7, help="report window in days (default 7)")
+    y.add_argument("--no-ledger", action="store_true", help="report only; don't update the buy-limit ledger")
+    y.add_argument("--calibrate", action="store_true", help="fetch wiki history for each completed trade and classify fills (network heavy)")
+    y.add_argument("--max-items", type=int, default=40, help="calibrate: cap on distinct items to fetch history for")
+    y.set_defaults(func=cmd_sync)
     return p
 
 
