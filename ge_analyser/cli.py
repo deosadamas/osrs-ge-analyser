@@ -115,7 +115,7 @@ def cmd_flips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> Non
     now = int(time.time())
     items = client.mapping()
     latest = client.latest()
-    hour = client.window("1h")
+    hour = client.hourly()
     flips = find_flips(
         items,
         latest,
@@ -183,7 +183,7 @@ def cmd_item(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
     items = client.mapping()
     item = _find_item(items, args.query)
     latest = client.latest().get(item.id)
-    hour = client.window("1h").get(item.id)
+    hour = client.hourly().get(item.id)
     now = int(time.time())
 
     print(f"{item.name} (id {item.id}){' [members]' if item.members else ''}")
@@ -216,7 +216,7 @@ def cmd_dips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
     now = int(time.time())
     items = client.mapping()
     latest = client.latest()
-    hour = client.window("1h")
+    hour = client.hourly()
     budget = parse_gp(args.budget)
     members = _members_filter(args)
 
@@ -326,7 +326,7 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
     n = 0
     while args.ticks == 0 or n < args.ticks:
         now = int(time.time())
-        latest, five, hour = client.latest(), client.window("5m"), client.window("1h")
+        latest, five, hour = client.latest(), client.window("5m"), client.hourly()
         snap = snapshot_from_live(latest, five)
         sim.step(snap, latest, hour, now)
         state.save(path)
@@ -340,7 +340,7 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
 
 def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], cfg: Config) -> None:
     budget = parse_gp(args.budget)
-    hour = client.window("1h")
+    hour = client.hourly()
     liquid = sorted(
         (i for i, w in hour.items() if i in items and (cfg.members is None or items[i].members == cfg.members)),
         key=lambda i: min(hour[i].high_volume, hour[i].low_volume),

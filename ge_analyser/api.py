@@ -107,6 +107,28 @@ class GEClient:
             for item_id, row in raw.items()
         }
 
+    def hourly(self) -> dict[int, WindowPrice]:
+        """Hourly volume robust to feed gaps.
+
+        `/1h` is the last *completed* hour; after an ingestion outage it can sit at a
+        fraction of normal volume for up to an hour. Per item, take the larger of the 1h
+        window and the 5m window extrapolated x12. Prices come from the 1h window when
+        present, else the 5m window.
+        """
+        hour = self.window("1h")
+        five = self.window("5m")
+        out: dict[int, WindowPrice] = {}
+        for item_id in hour.keys() | five.keys():
+            h = hour.get(item_id)
+            f = five.get(item_id)
+            out[item_id] = WindowPrice(
+                avg_high=(h.avg_high if h and h.avg_high else f.avg_high if f else None),
+                high_volume=max(h.high_volume if h else 0, f.high_volume * 12 if f else 0),
+                avg_low=(h.avg_low if h and h.avg_low else f.avg_low if f else None),
+                low_volume=max(h.low_volume if h else 0, f.low_volume * 12 if f else 0),
+            )
+        return out
+
     def timeseries(self, item_id: int, step: str = "1h") -> list[dict[str, Any]]:
         """Up to 365 data points for one item. step: 5m, 1h, 6h, 24h."""
         if step not in ("5m", "1h", "6h", "24h"):
