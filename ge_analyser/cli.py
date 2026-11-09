@@ -17,9 +17,11 @@ from .analysis import (
     fmt_gp,
     ge_tax,
     parse_gp,
+    remaining_limit,
     trend_from_timeseries,
 )
 from .api import GEClient, ItemInfo
+from .ledger import Ledger
 
 
 def _table(headers: list[str], rows: list[list[str]], right: set[int] = frozenset()) -> str:
@@ -49,7 +51,7 @@ def _print_flips(flips: list[Flip]) -> None:
             fmt_gp(f.sell),
             fmt_gp(f.margin),
             f"{f.roi * 100:.1f}%",
-            str(f.item.limit or "-"),
+            (f"{f.limit_left:,}/{f.item.limit:,}" if f.limit_left != f.item.limit else f"{f.item.limit:,}") if f.item.limit else "-",
             f"{f.hourly_volume:,}",
             f"{f.quantity:,}",
             fmt_gp(f.profit),
@@ -89,7 +91,11 @@ def _members_filter(args: argparse.Namespace) -> bool | None:
     return None
 
 
-def cmd_flips(args: argparse.Namespace, client: GEClient) -> None:
+def _used(args: argparse.Namespace, ledger: Ledger, now: int) -> dict[int, int]:
+    return {} if args.ignore_ledger else ledger.used(now)
+
+
+def cmd_flips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
     now = int(time.time())
     items = client.mapping()
     latest = client.latest()
@@ -105,6 +111,7 @@ def cmd_flips(args: argparse.Namespace, client: GEClient) -> None:
         min_roi=args.min_roi / 100,
         max_age_s=args.max_age * 60,
         members=_members_filter(args),
+        used=_used(args, ledger, now),
     )
     if not flips:
         print("No flips matched the filters.")
@@ -112,9 +119,47 @@ def cmd_flips(args: argparse.Namespace, client: GEClient) -> None:
     print(f"Top {min(args.top, len(flips))} of {len(flips)} candidate flips (budget {fmt_gp(parse_gp(args.budget))})\n")
     _print_flips(flips[: args.top])
     print("\nBuy = place buy offer at this price; Sell = place sell offer at this price. Margin is after 2% GE tax.")
+    print("Limit = units still buyable this 4h window; record purchases with `ge-analyser bought <item> <qty>`.")
 
 
-def cmd_item(args: argparse.Namespace, client: GEClient) -> None:
+def cmd_bought(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
+    now = int(time.time())
+    items = client.mapping()
+    if args.clear:
+        item = _find_item(items, args.query) if args.query else None
+        n = ledger.clear(item.id if item else None)
+        print(f"Cleared {n} purchase record(s){f' for {item.name}' if item else ''}.")
+        return
+    if args.query and args.qty is not None:
+        if args.qty <= 0:
+            sys.exit("qty must be positive")
+        item = _find_item(items, args.query)
+        ledger.record(item.id, args.qty, now)
+        used = ledger.used(now)[item.id]
+        left = remaining_limit(item, used)
+        if item.limit:
+            print(f"Recorded {args.qty:,} x {item.name}. {used:,}/{item.limit:,} used, {left:,} left; resets in {_age(ledger.resets_at(item.id, now) - now)}.")
+        else:
+            print(f"Recorded {args.qty:,} x {item.name} (buy limit unknown).")
+        return
+    if args.query or args.qty is not None:
+        sys.exit("usage: ge-analyser bought <item> <qty>   |   ge-analyser bought [--clear [item]]")
+
+    used = ledger.used(now)
+    if not used:
+        print("No purchases in the current 4h window.")
+        return
+    rows = []
+    for item_id, qty in sorted(used.items(), key=lambda kv: items[kv[0]].name if kv[0] in items else ""):
+        item = items.get(item_id)
+        name = item.name if item else f"id {item_id}"
+        limit = item.limit if item else 0
+        reset = ledger.resets_at(item_id, now) or now
+        rows.append([name, f"{qty:,}", f"{limit:,}" if limit else "-", f"{remaining_limit(item, qty):,}" if item and limit else "-", _age(max(reset - now, 0))])
+    print(_table(["Item", "Bought", "Limit", "Left", "Resets in"], rows, right={1, 2, 3, 4}))
+
+
+def cmd_item(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
     items = client.mapping()
     item = _find_item(items, args.query)
     latest = client.latest().get(item.id)
@@ -122,7 +167,13 @@ def cmd_item(args: argparse.Namespace, client: GEClient) -> None:
     now = int(time.time())
 
     print(f"{item.name} (id {item.id}){' [members]' if item.members else ''}")
-    print(f"  Buy limit: {item.limit or 'unknown'}   High alch: {fmt_gp(item.highalch)}")
+    used = ledger.used(now).get(item.id, 0)
+    if item.limit and used:
+        reset = ledger.resets_at(item.id, now)
+        left = remaining_limit(item, used)
+        print(f"  Buy limit: {left}/{item.limit} left (bought {used}, resets in {_age(max(reset - now, 0))})   High alch: {fmt_gp(item.highalch)}")
+    else:
+        print(f"  Buy limit: {item.limit or 'unknown'}   High alch: {fmt_gp(item.highalch)}")
     if latest and latest.high and latest.low:
         tax = ge_tax(latest.high, item.name)
         margin = latest.high - tax - latest.low
@@ -140,7 +191,7 @@ def cmd_item(args: argparse.Namespace, client: GEClient) -> None:
         print(f"  Trend {label}: mean {fmt_gp(trend.mean)}, now {fmt_gp(trend.latest)}, z={trend.z_score:+.2f}, change {trend.change_pct:+.1f}%  -> {signal}")
 
 
-def cmd_dips(args: argparse.Namespace, client: GEClient) -> None:
+def cmd_dips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
     """Among liquid items, find those currently priced well below their 24h average."""
     now = int(time.time())
     items = client.mapping()
@@ -192,6 +243,7 @@ def cmd_dips(args: argparse.Namespace, client: GEClient) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ge-analyser", description="OSRS Grand Exchange flip & trend analyser")
     p.add_argument("--no-cache", action="store_true", help="bypass the local response cache")
+    p.add_argument("--ignore-ledger", action="store_true", help="assume fresh buy limits, ignoring recorded purchases")
     sub = p.add_subparsers(dest="command", required=True)
 
     def common(sp: argparse.ArgumentParser) -> None:
@@ -213,6 +265,12 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("query")
     i.set_defaults(func=cmd_item)
 
+    b = sub.add_parser("bought", help="record a purchase so remaining buy limits are tracked")
+    b.add_argument("query", nargs="?", help="item name or id")
+    b.add_argument("qty", nargs="?", type=int, help="units bought")
+    b.add_argument("--clear", action="store_true", help="forget recorded purchases (all, or for the given item)")
+    b.set_defaults(func=cmd_bought)
+
     d = sub.add_parser("dips", help="liquid items priced below their 24h average")
     common(d)
     d.add_argument("--scan", type=int, default=60, help="how many of the most liquid items to fetch history for")
@@ -224,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     client = GEClient(cache_ttl=0 if args.no_cache else 60)
-    args.func(args, client)
+    args.func(args, client, Ledger())
 
 
 if __name__ == "__main__":

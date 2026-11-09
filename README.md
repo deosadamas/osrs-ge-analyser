@@ -4,13 +4,14 @@ Grand Exchange analyser for Old School RuneScape. Pulls live prices from the
 [OSRS Wiki real-time prices API](https://oldschool.runescape.wiki/w/RuneScape:Real-time_Prices)
 and tells you what to buy and sell.
 
-Three signals:
+Four commands:
 
 | Command | What it does |
 |---------|--------------|
 | `flips` | Ranks items by instant-sell → instant-buy margin **after the 2% GE tax**, bounded by buy limit, your budget and last-hour volume. |
 | `item`  | Full detail for one item: current spread, hourly volume, 24h and ~3-month trend with a buy/sell/neutral verdict. |
 | `dips`  | Scans the most liquid items and flags ones trading ≥ N standard deviations below their 24h mean (mean-reversion buys). |
+| `bought` | Records what you've bought so remaining 4-hour buy limits are honoured by `flips` and `item`. |
 
 No third-party dependencies; Python 3.10+.
 
@@ -53,6 +54,24 @@ Dragon bones     2,650    2,789       83  3.1%  11000  3,120  780   64.7k   2m
 - **Qty**: `min(buy limit, budget / Buy, Vol/h ÷ 4)`; assumes you capture at most a quarter of an hour's volume.
 - **Profit**: `Margin × Qty` for one 4-hour buy-limit cycle.
 - **Age**: time since the older of the two prices; stale prices are scored down.
+
+## Buy-limit tracking
+
+GE buy limits are per item per rolling 4-hour window. The analyser is stateless about
+the game, so tell it what you bought and it will cap `Qty` at what you have left and
+drop items whose limit is exhausted:
+
+```sh
+ge-analyser bought "ruby necklace" 11000   # Recorded ... 11,000/18,000 used, 7,000 left; resets in 4h00
+ge-analyser bought                         # table of in-window purchases and when each resets
+ge-analyser bought --clear [item]          # forget purchases (all, or one item)
+ge-analyser --ignore-ledger flips          # one-off: pretend limits are fresh
+```
+
+Purchases live in `~/.osrs-ge-analyser/ledger.json` (override with `GE_ANALYSER_LEDGER`)
+and expire 4 hours after they were recorded. The `Limit` column shows `left/limit` when
+part of a limit is used. Connected limits (e.g. Prayer potion doses sharing one limit)
+aren't in the API data and are not modelled.
 
 ## How ranking works
 

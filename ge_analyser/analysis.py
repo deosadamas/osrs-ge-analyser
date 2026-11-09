@@ -88,16 +88,24 @@ class Flip:
     margin: int  # per-unit profit after tax
     roi: float  # margin / buy
     hourly_volume: int  # conservative: min(buys, sells) in last hour
+    limit_left: int  # remaining 4h buy limit (item.limit when nothing recorded; 0 = unknown)
     quantity: int  # units you can realistically flip given limit, budget, volume
     profit: int  # margin * quantity
     price_age_s: int  # seconds since the older of the two latest prices
     score: float
 
 
-def flip_quantity(item: ItemInfo, buy: int, hourly_volume: int, budget: int) -> int:
-    """Units for one flip cycle: bounded by buy limit, budget, and recent volume."""
+def remaining_limit(item: ItemInfo, used: int) -> int:
+    """Units still purchasable this 4h window. Unknown limit (0) stays 0."""
+    if item.limit <= 0:
+        return 0
+    return max(item.limit - used, 0)
+
+
+def flip_quantity(item: ItemInfo, buy: int, hourly_volume: int, budget: int, used: int = 0) -> int:
+    """Units for one flip cycle: bounded by remaining buy limit, budget, and recent volume."""
     by_budget = budget // buy if buy > 0 else 0
-    by_limit = item.limit if item.limit > 0 else by_budget
+    by_limit = remaining_limit(item, used) if item.limit > 0 else by_budget
     # Assume you can capture at most ~1/4 of an hour's two-sided volume.
     by_volume = max(hourly_volume // 4, 1)
     return max(min(by_budget, by_limit, by_volume), 0)
@@ -109,6 +117,7 @@ def evaluate_flip(
     hour: WindowPrice | None,
     budget: int,
     now: int,
+    used: int = 0,
 ) -> Flip | None:
     if latest.high is None or latest.low is None or latest.high_time is None or latest.low_time is None:
         return None
@@ -120,7 +129,7 @@ def evaluate_flip(
     if margin <= 0:
         return None
     hourly_volume = min(hour.high_volume, hour.low_volume) if hour else 0
-    qty = flip_quantity(item, buy, hourly_volume, budget)
+    qty = flip_quantity(item, buy, hourly_volume, budget, used)
     if qty == 0:
         return None
     profit = margin * qty
@@ -138,6 +147,7 @@ def evaluate_flip(
         margin=margin,
         roi=roi,
         hourly_volume=hourly_volume,
+        limit_left=remaining_limit(item, used),
         quantity=qty,
         profit=profit,
         price_age_s=age,
@@ -156,7 +166,9 @@ def find_flips(
     min_roi: float = 0.0,
     max_age_s: int = 3600,
     members: bool | None = None,
+    used: dict[int, int] | None = None,
 ) -> list[Flip]:
+    used = used or {}
     out: list[Flip] = []
     for item_id, price in latest.items():
         item = items.get(item_id)
@@ -164,7 +176,7 @@ def find_flips(
             continue
         if members is not None and item.members != members:
             continue
-        flip = evaluate_flip(item, price, hour.get(item_id), budget, now)
+        flip = evaluate_flip(item, price, hour.get(item_id), budget, now, used.get(item_id, 0))
         if flip is None:
             continue
         if flip.hourly_volume < min_volume or flip.margin < min_margin:
