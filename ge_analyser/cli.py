@@ -114,7 +114,11 @@ def cmd_flips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> Non
         used=_used(args, ledger, now),
     )
     if not flips:
+        ages = [now - min(p.high_time, p.low_time) for p in latest.values() if p.high_time and p.low_time]
+        freshest = min(ages) if ages else None
         print("No flips matched the filters.")
+        if freshest is not None and freshest > args.max_age * 60:
+            print(f"Newest price in the feed is {_age(freshest)} old (> --max-age {args.max_age}m); the wiki feed may be lagging. Try --max-age {max(freshest // 60 + 30, 60)}.")
         return
     print(f"Top {min(args.top, len(flips))} of {len(flips)} candidate flips (budget {fmt_gp(parse_gp(args.budget))})\n")
     _print_flips(flips[: args.top])
