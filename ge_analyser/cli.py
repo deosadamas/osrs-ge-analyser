@@ -3,13 +3,16 @@
     ge-analyser flips --budget 10m --top 20
     ge-analyser item "Abyssal whip"
     ge-analyser dips --budget 10m --top 15
+    ge-analyser simulate --budget 10k --backtest 24
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
+from pathlib import Path
 
 from .analysis import (
     Flip,
@@ -22,6 +25,16 @@ from .analysis import (
 )
 from .api import GEClient, ItemInfo
 from .ledger import Ledger
+from .sim import (
+    Config,
+    Simulator,
+    Snapshot,
+    State,
+    hour_from_history,
+    latest_from_snapshot,
+    snapshot_from_buckets,
+    snapshot_from_live,
+)
 
 
 def _table(headers: list[str], rows: list[list[str]], right: set[int] = frozenset()) -> str:
@@ -244,6 +257,130 @@ def cmd_dips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
     print("\nDips are mean-reversion bets: check the drop isn't caused by a game update before buying.")
 
 
+def _sim_path() -> Path:
+    override = os.environ.get("GE_ANALYSER_SIM")
+    return Path(override) if override else Path.home() / ".osrs-ge-analyser" / "sim.json"
+
+
+def _print_sim(state: State, snapshot: Snapshot, now: int, tail: int = 15) -> None:
+    equity = state.equity(snapshot)
+    pnl = equity - state.start_cash
+    sells = [t for t in state.trades if t.kind == "sell"]
+    wins = sum(1 for t in sells if t.profit > 0)
+    print(f"Tick {state.ticks}  cash {fmt_gp(state.cash)}  reserved {fmt_gp(state.reserved())}  holdings {fmt_gp(state.holdings_value(snapshot))}")
+    print(f"Equity {fmt_gp(equity)} ({pnl:+,} gp, {pnl / state.start_cash * 100:+.1f}%)   realised {state.realised:+,}   sells {len(sells)} (win {wins})")
+    if state.orders:
+        rows = []
+        for o in state.orders:
+            tick = snapshot.get(o.item_id)
+            mkt = (tick.low if o.kind == "buy" else tick.high) if tick else None
+            rows.append([o.kind, o.name, f"{o.remaining:,}", fmt_gp(o.price), fmt_gp(mkt) if mkt else "-", fmt_gp(o.cost_basis) if o.kind == "sell" else "", _age(max(now - o.placed, 0))])
+        print("\nOpen offers:")
+        print(_table(["Side", "Item", "Qty", "Price", "Market", "Cost", "Age"], rows, right={2, 3, 4, 5, 6}))
+    if state.log:
+        print(f"\nLast {min(tail, len(state.log))} events:")
+        for line in state.log[-tail:]:
+            ts, msg = line.split("\t", 1)
+            print(f"  {time.strftime('%m-%d %H:%M', time.localtime(int(ts)))}  {msg}")
+
+
+def _sim_config(args: argparse.Namespace) -> Config:
+    members = _members_filter(args)
+    slots = args.slots if args.slots is not None else (3 if members is False else 8)
+    return Config(
+        slots=slots,
+        min_volume=args.min_volume,
+        max_age=args.max_age * 60,
+        members=members,
+        fill_share=args.fill_share,
+        strict=not args.loose,
+        min_margin=args.min_margin,
+        min_roi=args.min_roi / 100,
+    )
+
+
+def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
+    path = _sim_path()
+    if args.reset:
+        if path.exists():
+            path.unlink()
+        print("Simulation state deleted.")
+        return
+    items = client.mapping()
+    cfg = _sim_config(args)
+
+    if args.backtest:
+        _backtest(args, client, items, cfg)
+        return
+
+    state = State.load(path) if path.exists() else State(start_cash=parse_gp(args.budget), cash=parse_gp(args.budget))
+    sim = Simulator(state, items, cfg)
+    if args.status:
+        snap = snapshot_from_live(client.latest(), client.window("5m"))
+        _print_sim(state, snap, int(time.time()))
+        return
+
+    n = 0
+    while args.ticks == 0 or n < args.ticks:
+        now = int(time.time())
+        latest, five, hour = client.latest(), client.window("5m"), client.window("1h")
+        snap = snapshot_from_live(latest, five)
+        sim.step(snap, latest, hour, now)
+        state.save(path)
+        print(f"--- {time.strftime('%H:%M:%S', time.localtime(now))} ---")
+        _print_sim(state, snap, now, tail=8)
+        n += 1
+        if args.ticks == 0 or n < args.ticks:
+            time.sleep(args.interval)
+    print(f"\nState saved to {path}. Resume with `ge-analyser simulate --ticks N`, inspect with --status.")
+
+
+def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], cfg: Config) -> None:
+    budget = parse_gp(args.budget)
+    hour = client.window("1h")
+    liquid = sorted(
+        (i for i, w in hour.items() if i in items and (cfg.members is None or items[i].members == cfg.members)),
+        key=lambda i: min(hour[i].high_volume, hour[i].low_volume),
+        reverse=True,
+    )[: args.scan]
+    print(f"Backtest: {args.backtest:g}h of 5m history, {len(liquid)} most liquid items, start {fmt_gp(budget)}, {cfg.slots} slots")
+
+    by_ts: dict[int, dict[int, dict]] = {}
+    for item_id in liquid:
+        for b in client.timeseries(item_id, "5m"):
+            by_ts.setdefault(b["timestamp"], {})[item_id] = b
+    timestamps = sorted(by_ts)
+    if not timestamps:
+        sys.exit("No history returned.")
+    start_ts = timestamps[-1] - int(args.backtest * 3600)
+    # Keep one hour of warm-up buckets so hourly volume is populated at the first decision.
+    warmup = [ts for ts in timestamps if ts < start_ts][-12:]
+    run = [ts for ts in timestamps if ts >= start_ts]
+
+    state = State(start_cash=budget, cash=budget)
+    cfg.max_age = 10 * 60  # buckets are always fresh relative to their own timestamp
+    sim = Simulator(state, items, cfg)
+    history: list[Snapshot] = [snapshot_from_buckets(by_ts[ts], ts) for ts in warmup]
+    snap: Snapshot = {}
+    for ts in run:
+        snap = snapshot_from_buckets(by_ts[ts], ts)
+        history.append(snap)
+        del history[:-12]
+        sim.step(snap, latest_from_snapshot(snap), hour_from_history(history), ts)
+    # Mark-to-market any leftovers at the final print.
+    print(f"Replayed {len(run)} buckets from {time.strftime('%m-%d %H:%M', time.localtime(run[0]))} to {time.strftime('%m-%d %H:%M', time.localtime(run[-1]))}\n")
+    _print_sim(state, snap, run[-1], tail=25)
+    sells = [t for t in state.trades if t.kind == "sell"]
+    if sells:
+        by_item: dict[str, int] = {}
+        for t in sells:
+            by_item[t.name] = by_item.get(t.name, 0) + t.profit
+        ranked = sorted(by_item.items(), key=lambda kv: kv[1], reverse=True)
+        print("\nRealised P&L by item:")
+        print(_table(["Item", "Profit"], [[n, f"{p:+,}"] for n, p in ranked], right={1}))
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ge-analyser", description="OSRS Grand Exchange flip & trend analyser")
     p.add_argument("--no-cache", action="store_true", help="bypass the local response cache")
@@ -280,6 +417,26 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--scan", type=int, default=60, help="how many of the most liquid items to fetch history for")
     d.add_argument("--z", type=float, default=1.0, help="min standard deviations below the mean")
     d.set_defaults(func=cmd_dips)
+
+    s = sub.add_parser("simulate", help="paper-trading agent: places and fills simulated offers from the flip ranking")
+    s.add_argument("--budget", default="10k", help="starting cash for a new simulation (default 10k)")
+    s.add_argument("--slots", type=int, default=None, help="GE slots (default 8, or 3 with --f2p)")
+    s.add_argument("--min-volume", type=int, default=50, help="min two-sided units traded per hour")
+    s.add_argument("--max-age", type=int, default=60, help="ignore prices older than N minutes (live mode)")
+    s.add_argument("--fill-share", type=int, default=10, help="assume we capture 1/N of each window's volume (higher = more conservative)")
+    s.add_argument("--loose", action="store_true", help="fill when the market touches our price instead of crossing it (optimistic)")
+    s.add_argument("--min-margin", type=int, default=2, help="min per-unit profit after tax to enter a flip")
+    s.add_argument("--min-roi", type=float, default=2.0, help="min ROI percent to enter a flip")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--f2p", action="store_true", help="free-to-play items only")
+    g.add_argument("--members", action="store_true", help="members items only")
+    s.add_argument("--interval", type=int, default=300, help="seconds between live ticks")
+    s.add_argument("--ticks", type=int, default=1, help="live ticks to run (0 = forever)")
+    s.add_argument("--backtest", type=float, metavar="HOURS", help="replay the last N hours of 5m history instead of trading live")
+    s.add_argument("--scan", type=int, default=40, help="backtest: number of most-liquid items to replay")
+    s.add_argument("--status", action="store_true", help="show the live simulation portfolio and exit")
+    s.add_argument("--reset", action="store_true", help="delete the live simulation state")
+    s.set_defaults(func=cmd_simulate)
     return p
 
 
