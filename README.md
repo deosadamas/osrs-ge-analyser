@@ -191,8 +191,10 @@ time-of-week buckets** (six 4-hour UTC blocks × weekday/weekend), cached for 6 
 | `typical_volume` | Median one-sided units/hour. The liquidity planned on is `min(live hourly volume, typical for this time of week)`, so a Sunday-evening volume spike doesn't size Tuesday-morning offers. |
 
 A bucket is used for an item only when it has ≥ 72 two-sided windows (6 hours of
-prints); otherwise the item's overall stats apply. Items with < 12 windows overall are
-illiquid by definition: `Fill = 1%` and they sink.
+prints), and its estimate is shrunk toward the item's overall estimate with weight
+`n / (n + 288)` — a day of prints is trusted half-way, a week 7/8. Without shrinkage the
+raw bucket rates were too noisy on 14 days of data and lost to flat features. Items with
+< 12 windows overall are illiquid by definition: `Fill = 1%` and they sink.
 
 Score: `Expect = min(margin, Typ) × Qty × Fill`, then
 `score = Expect × 1/(1 + age_h) × (0.5 + ln(1 + liquidity)/10) × 1/(1 + Vol% / ROI%)`.
@@ -202,9 +204,18 @@ Does it help? Same strict fill model, same 10k start, all items, features comput
 from windows *before* each replay (`simulate --backtest H --compare` runs three
 variants: time-of-week features, flat features, legacy):
 
-| Replay | Time-of-week | Flat features | Legacy | Win rate (tow / flat / legacy) |
-|---|---|---|---|---|
-| 24h, 5 days of features | +128% | +109% | +100% | 62% / 65% / 38% |
+| Replay (14 d of features) | Time-of-week | Flat features | Legacy |
+|---|---|---|---|
+| 24h | **+149%** | +101% | +104% |
+| 72h | +1,380% | **+1,444%** | +1,379% |
+| 96h | **+1,950%** | +1,721% | +1,745% |
+| 168h | **+5,923%** | +4,959% | +1,705% |
+| 96h, F2P, 3 slots | +178% | **+232%** | +155% |
+
+Time-of-week wins three of five, flat two; both beat legacy in every run, and the gap
+opens with horizon (3.5× over a week). The remaining noise between the two feature
+variants is what more history (the store keeps growing) and your real fills (`sync
+--calibrate`) are for.
 
 Absolute returns are backtest numbers on a tiny stack and compound; read the ratios and
 win rates, not the magnitudes.

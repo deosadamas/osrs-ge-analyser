@@ -28,9 +28,10 @@ from .history import HistoryStore
 
 CROSS_WINDOW_S = 30 * 60
 MIN_WINDOWS = 12  # at least an hour of two-sided prints to say anything overall
-MIN_BUCKET_WINDOWS = 72  # six hours of two-sided prints before trusting a bucket
+MIN_BUCKET_WINDOWS = 72  # six hours of two-sided prints before trusting a bucket at all
+SHRINK_WINDOWS = 288  # prior weight (in 5m windows) pulling bucket stats toward overall
 N_BUCKETS = 12
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def bucket_of(ts: int) -> int:
@@ -125,6 +126,21 @@ class TimedStats:
         return cls(overall=dec(raw["overall"]), buckets={int(b): dec(d) for b, d in raw["buckets"].items()})
 
 
+def shrink(bucket: ItemStats, overall: ItemStats, k: int = SHRINK_WINDOWS) -> ItemStats:
+    """Blend a bucket's estimate toward the item's overall estimate with weight n/(n+k).
+    A bucket with a day of prints is trusted half-way; a bucket with a week, 7/8."""
+    w = bucket.windows / (bucket.windows + k)
+    mix = lambda a, b: w * a + (1 - w) * b
+    return ItemStats(
+        windows=bucket.windows,
+        fill_buy=mix(bucket.fill_buy, overall.fill_buy),
+        fill_sell=mix(bucket.fill_sell, overall.fill_sell),
+        median_margin=int(round(mix(bucket.median_margin, overall.median_margin))),
+        volatility_pct=mix(bucket.volatility_pct, overall.volatility_pct),
+        typical_volume=int(round(mix(bucket.typical_volume, overall.typical_volume))),
+    )
+
+
 def compute_timed_stats(store: HistoryStore, names: dict[int, str], since: int, until: int | None = None) -> TimedStats:
     ts_stats = TimedStats(buckets={b: {} for b in range(N_BUCKETS)})
     for item_id, rows in store.iter_series(since, until):
@@ -140,7 +156,7 @@ def compute_timed_stats(store: HistoryStore, names: dict[int, str], since: int, 
         for b, bws in by_bucket.items():
             s = stats_from_windows(bws, name, MIN_BUCKET_WINDOWS)
             if s is not None:
-                ts_stats.buckets[b][item_id] = s
+                ts_stats.buckets[b][item_id] = shrink(s, overall)
     return ts_stats
 
 

@@ -1,3 +1,5 @@
+import pytest
+
 from ge_analyser.analysis import UNKNOWN_STATS, ItemStats, evaluate_flip, find_flips
 from ge_analyser.api import ItemInfo, LatestPrice, WindowPrice
 from ge_analyser.features import TimedStats, bucket_of, compute_stats, compute_timed_stats, item_stats
@@ -73,14 +75,19 @@ def test_timed_stats_buckets_and_liquidity(tmp_path):
     weekend_ts = next(T0 + i * STEP for i in range(14 * 288) if bucket_of(T0 + i * STEP) >= 6)
     weekday_ts = next(T0 + i * STEP for i in range(14 * 288) if bucket_of(T0 + i * STEP) < 6)
     wk, wd = timed.at(weekend_ts)[440], timed.at(weekday_ts)[440]
-    assert wk.fill_buy == 0.5 and wd.fill_buy < 0.05  # weekday windows just before Saturday see the first dip
-    assert wk.typical_volume == 50 * 12 and wd.typical_volume == 5 * 12
+    # Bucket estimates are shrunk toward overall with weight n/(n+288): the raw weekend
+    # rate is 0.5 and the raw weekday rate ~0, so they land strictly between raw and overall.
+    assert overall.fill_buy < wk.fill_buy < 0.5
+    assert 0.0 < wd.fill_buy < overall.fill_buy
+    w_wk, w_wd = wk.windows / (wk.windows + 288), wd.windows / (wd.windows + 288)
+    assert wk.fill_buy == pytest.approx(w_wk * 0.5 + (1 - w_wk) * overall.fill_buy)
+    assert wk.typical_volume == round(w_wk * 600 + (1 - w_wk) * overall.typical_volume)
+    assert wd.typical_volume == round(w_wd * 60 + (1 - w_wd) * overall.typical_volume)
     assert timed.flat_at(weekend_ts)[440] is overall
     # Liquidity planned on is min(live volume, typical for this moment).
     item = ItemInfo(440, "Iron ore", False, 13000, 0, 0)
-    live = WindowPrice(None, 10_000, None, 10_000)
-    f = evaluate_flip(item, LatestPrice(110, weekday_ts, 100, weekday_ts), live, 10**7, weekday_ts, stats=wd)
-    assert f.liquidity == 60 and f.quantity == 15  # 60/4
+    f = evaluate_flip(item, LatestPrice(110, weekday_ts, 100, weekday_ts), WindowPrice(None, 10_000, None, 10_000), 10**7, weekday_ts, stats=wd)
+    assert f.liquidity == wd.typical_volume and f.quantity == wd.typical_volume // 4
     f = evaluate_flip(item, LatestPrice(110, weekend_ts, 100, weekend_ts), WindowPrice(None, 100, None, 100), 10**7, weekend_ts, stats=wk)
     assert f.liquidity == 100
     assert TimedStats.decode(timed.encode()).at(weekend_ts)[440] == wk
