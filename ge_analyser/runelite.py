@@ -105,9 +105,69 @@ def parse_account(path: Path) -> list[RealTrade]:
     return out
 
 
+def plugin_log_path() -> Path:
+    return Path.home() / ".osrs-ge-analyser" / "runelite-trades.jsonl"
+
+
+def parse_plugin_log(path: Path) -> list[RealTrade]:
+    """Trades recorded by the bundled GE Analyser RuneLite plugin (runelite-plugin/).
+
+    One JSON object per line, one line per GrandExchangeOfferChanged event:
+      {"t": unix, "acc": name, "slot": n, "b": bool, "id": item, "name": str,
+       "qty": traded so far, "total": offered, "price": avg per unit, "st": state,
+       "placed": unix when the offer was first seen in this slot}
+    Each trade is represented by its last event (events for the same slot and item
+    supersede earlier ones until a complete state is seen).
+    """
+    last: dict[tuple[str, int], dict] = {}
+    done: list[dict] = []
+    seen: set[tuple] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        ev = json.loads(line)
+        if ev.get("st") == "EMPTY" or int(ev.get("id", 0)) == 0:
+            continue
+        key = (ev.get("acc", path.stem), int(ev.get("slot", -1)))
+        last[key] = ev
+        if ev.get("st") in COMPLETE_STATES:
+            # The client replays every slot's final state on login; an identical completed
+            # trade in the same slot is that replay, not a second trade.
+            sig = (*key, ev.get("id"), ev.get("b"), ev.get("qty"), ev.get("total"), ev.get("price"), ev.get("st"))
+            if sig not in seen:
+                seen.add(sig)
+                done.append(ev)
+            del last[key]
+    out: list[RealTrade] = []
+    for ev in done + list(last.values()):
+        qty = int(ev.get("qty", 0))
+        if qty <= 0:
+            continue
+        ts = int(ev["t"])
+        placed = ev.get("placed")
+        out.append(
+            RealTrade(
+                account=ev.get("acc", path.stem),
+                item_id=int(ev["id"]),
+                name=ev.get("name") or f"id {ev['id']}",
+                buy=bool(ev.get("b", False)),
+                qty=qty,
+                offered_qty=int(ev.get("total", qty)),
+                price=int(ev.get("price", 0)),
+                ts=ts,
+                state=str(ev.get("st", "")),
+                complete=ev.get("st") in COMPLETE_STATES,
+                fill_seconds=float(ts - placed) if isinstance(placed, (int, float)) and ts > placed else None,
+            )
+        )
+    out.sort(key=lambda t: t.ts)
+    return out
+
+
 def load_trades(paths: Iterable[Path]) -> list[RealTrade]:
     trades: list[RealTrade] = []
     for p in paths:
-        trades.extend(parse_account(p))
+        trades.extend(parse_plugin_log(p) if p.suffix == ".jsonl" else parse_account(p))
     trades.sort(key=lambda t: t.ts)
     return trades

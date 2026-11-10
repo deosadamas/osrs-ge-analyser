@@ -134,6 +134,17 @@ def flip_quantity(item: ItemInfo, buy: int, hourly_volume: int, budget: int, use
     return max(min(by_budget, by_limit, by_volume), 0)
 
 
+@dataclass(frozen=True)
+class ScoreParams:
+    """Tunable constants in the score (see `ge-analyser tune`)."""
+
+    liq_weight: float = 10.0  # liquidity term is 0.5 + ln(1 + units/h) / liq_weight
+    vol_penalty: float = 1.0  # risk term is 1 / (1 + vol_penalty * Vol% / ROI%)
+
+
+DEFAULT_PARAMS = ScoreParams()
+
+
 def evaluate_flip(
     item: ItemInfo,
     latest: LatestPrice,
@@ -142,6 +153,7 @@ def evaluate_flip(
     now: int,
     used: int = 0,
     stats: ItemStats | None = None,
+    params: ScoreParams = DEFAULT_PARAMS,
 ) -> Flip | None:
     if latest.high is None or latest.low is None or latest.high_time is None or latest.low_time is None:
         return None
@@ -164,18 +176,19 @@ def evaluate_flip(
     age = now - min(latest.high_time, latest.low_time)
     staleness = 1.0 / (1.0 + age / 3600)
     liquidity = math.log1p(liq)
+    liq_term = 0.5 + liquidity / params.liq_weight
     if stats is None:
         # No history: profit per cycle, discounted by staleness, rewarding liquidity.
         expected = profit
-        score = profit * staleness * (0.5 + liquidity / 10)
+        score = profit * staleness * liq_term
     else:
         # With history: expected profit = typical margin (not today's spike) x units x
         # probability both legs fill, then penalised when 5m volatility rivals the margin.
         typical = margin if stats.windows == 0 else stats.median_margin
         edge = max(min(margin, typical), 1)
         expected = int(edge * qty * stats.p_fill)
-        risk = 1.0 / (1.0 + stats.volatility_pct / max(roi * 100, 0.01))
-        score = expected * staleness * (0.5 + liquidity / 10) * risk
+        risk = 1.0 / (1.0 + params.vol_penalty * stats.volatility_pct / max(roi * 100, 0.01))
+        score = expected * staleness * liq_term * risk
     return Flip(
         item=item,
         buy=buy,
@@ -208,6 +221,7 @@ def find_flips(
     members: bool | None = None,
     used: dict[int, int] | None = None,
     stats: dict[int, ItemStats] | None = None,
+    params: ScoreParams = DEFAULT_PARAMS,
 ) -> list[Flip]:
     used = used or {}
     out: list[Flip] = []
@@ -218,7 +232,7 @@ def find_flips(
         if members is not None and item.members != members:
             continue
         item_stats = None if stats is None else stats.get(item_id, UNKNOWN_STATS)
-        flip = evaluate_flip(item, price, hour.get(item_id), budget, now, used.get(item_id, 0), item_stats)
+        flip = evaluate_flip(item, price, hour.get(item_id), budget, now, used.get(item_id, 0), item_stats, params)
         if flip is None:
             continue
         if flip.liquidity < min_volume or flip.margin < min_margin:

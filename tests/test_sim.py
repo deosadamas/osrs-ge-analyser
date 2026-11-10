@@ -7,6 +7,7 @@ T0 = 1_700_000_000
 
 
 def make_sim(cash=10_000, **cfg):
+    cfg.setdefault("improve", False)  # most tests pin exact instant-price offers
     state = State(start_cash=cash, cash=cash)
     return Simulator(state, ITEMS, Config(**cfg)), state
 
@@ -97,3 +98,26 @@ def test_state_roundtrip(tmp_path):
     state.save(tmp_path / "sim.json")
     loaded = State.load(tmp_path / "sim.json")
     assert loaded.cash == state.cash and len(loaded.orders) == 1 and loaded.orders[0].kind == "buy"
+
+
+def test_improve_bids_one_better_and_fills_on_same_price_print():
+    sim, state = make_sim(slots=1, improve=True)
+    (buy,) = sim.decide(*market(low=100, high=110), T0)
+    assert buy.price == 101  # instant-sell + 1: we are now the best bid
+    # A later print at the old instant-sell (100) is below our 101 bid -> fills in strict mode.
+    sim.process_fills({440: Tick(110, T0 + 60, 100, T0 + 60, 1000, 1000)}, T0 + 60)
+    assert buy.filled == buy.qty
+    sell = next(o for o in state.orders if o.kind == "sell")
+    assert sell.price == 109 and sell.cost_basis == 101
+    # Improvement is skipped when it would eat the whole margin.
+    sim2, _ = make_sim(slots=1, improve=True, min_margin=2)
+    (tight,) = sim2.decide(*market(low=100, high=104), T0)  # raw margin 104-2-100=2; improved would be 1
+    assert tight.price == 100
+
+
+def test_min_stake_concentrates_small_stacks():
+    sim, state = make_sim(cash=10_000, slots=8, min_stake=2_500)
+    assert sim.usable_slots() == 4
+    placed = sim.decide(*market(low=100, high=110), T0)
+    assert len(placed) == 1  # one item in the market, but budget per slot was cash/4
+    assert placed[0].qty == 25  # 2,500 / 100

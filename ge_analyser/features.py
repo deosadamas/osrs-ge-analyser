@@ -141,7 +141,9 @@ def shrink(bucket: ItemStats, overall: ItemStats, k: int = SHRINK_WINDOWS) -> It
     )
 
 
-def compute_timed_stats(store: HistoryStore, names: dict[int, str], since: int, until: int | None = None) -> TimedStats:
+def compute_timed_stats(
+    store: HistoryStore, names: dict[int, str], since: int, until: int | None = None, shrink_k: int = SHRINK_WINDOWS
+) -> TimedStats:
     ts_stats = TimedStats(buckets={b: {} for b in range(N_BUCKETS)})
     for item_id, rows in store.iter_series(since, until):
         name = names.get(item_id, "")
@@ -156,7 +158,7 @@ def compute_timed_stats(store: HistoryStore, names: dict[int, str], since: int, 
         for b, bws in by_bucket.items():
             s = stats_from_windows(bws, name, MIN_BUCKET_WINDOWS)
             if s is not None:
-                ts_stats.buckets[b][item_id] = shrink(s, overall)
+                ts_stats.buckets[b][item_id] = shrink(s, overall, shrink_k)
     return ts_stats
 
 

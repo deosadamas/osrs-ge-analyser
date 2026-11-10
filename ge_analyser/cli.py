@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import statistics
 import sys
@@ -33,14 +34,14 @@ from .features import TimedStats, bucket_label, bucket_of, cached_timed_stats, c
 from .history import DEFAULT_DEPTH_DAYS, STEPS, HistoryStore
 from .ledger import Ledger, Purchase
 from . import runelite
+from .regime import detect
+from . import tune
 from .sim import (
     Config,
     Simulator,
     Snapshot,
     State,
-    hour_from_history,
-    latest_from_snapshot,
-    snapshot_from_buckets,
+    replay,
     snapshot_from_live,
 )
 
@@ -251,6 +252,11 @@ def cmd_item(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
                 f"typical margin {fmt_gp(bs.median_margin)}  typical volume {bs.typical_volume:,}/h"
             )
 
+    regime = detect(HistoryStore().daily_series(item.id))
+    if regime:
+        verdict = "structural re-level, do not expect reversion" if regime.structural else "no regime change"
+        print(f"  60d regime: last 7d mean {fmt_gp(regime.recent_mean)} vs prior 60d {fmt_gp(regime.prior_mean)} ({regime.change_pct:+.1f}%, {regime.persistent_days}/7 days beyond 15%) -> {verdict}")
+
     for lookback, label in (("24h", "24h (5m candles)"), ("30d", "30 days (1h candles)"), ("6m", "6 months (6h candles)")):
         trend = trend_from_timeseries(client.timeseries(item.id, lookback))
         if trend is None:
@@ -282,30 +288,37 @@ def cmd_dips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
     candidates.sort(key=lambda c: c[0], reverse=True)
     candidates = candidates[: args.scan]
 
+    store = HistoryStore()
     rows = []
+    skipped = 0
     for _, item, lp in candidates:
         trend = trend_from_timeseries(client.timeseries(item.id, "24h"))
         if trend is None or trend.z_score > -args.z:
             continue
+        regime = detect(store.daily_series(item.id))
+        if regime and regime.structural and not args.include_shifts:
+            skipped += 1
+            continue
         upside = trend.mean - lp.low
         tax = ge_tax(int(trend.mean), item.name)
-        rows.append((trend.z_score, item, lp.low, trend, upside - tax))
+        rows.append((trend.z_score, item, lp.low, trend, upside - tax, regime))
     rows.sort(key=lambda r: r[0])
     if not rows:
-        print("No dips found; relax --z or widen --scan.")
+        print("No dips found; relax --z or widen --scan." + (f" ({skipped} hidden as structural shifts; --include-shifts to see them)" if skipped else ""))
         return
-    print(f"Items trading below their 24h mean (scanned {len(candidates)} liquid items, z <= -{args.z})\n")
+    print(f"Items trading below their 24h mean (scanned {len(candidates)} liquid items, z <= -{args.z}" + (f", {skipped} hidden as structural shifts" if skipped else "") + ")\n")
     print(
         _table(
-            ["Item", "Now", "24h mean", "z", "24h chg", "Rebound/unit (after tax)"],
+            ["Item", "Now", "24h mean", "z", "24h chg", "Rebound/unit (after tax)", "60d regime"],
             [
-                [item.name, fmt_gp(low), fmt_gp(t.mean), f"{z:+.2f}", f"{t.change_pct:+.1f}%", fmt_gp(up)]
-                for z, item, low, t, up in rows[: args.top]
+                [item.name, fmt_gp(low), fmt_gp(t.mean), f"{z:+.2f}", f"{t.change_pct:+.1f}%", fmt_gp(up), r.label() if r else "?"]
+                for z, item, low, t, up, r in rows[: args.top]
             ],
             right={1, 2, 3, 4, 5},
         )
     )
-    print("\nDips are mean-reversion bets: check the drop isn't caused by a game update before buying.")
+    print("\nDips are mean-reversion bets. '60d regime' compares the last week with the prior two months; 'shift' means the")
+    print("price has re-levelled (likely a game update) and the 24h mean is not a target. Those rows are hidden by default.")
 
 
 def _sim_path() -> Path:
@@ -347,6 +360,8 @@ def _sim_config(args: argparse.Namespace) -> Config:
         strict=not args.loose,
         min_margin=args.min_margin,
         min_roi=args.min_roi / 100,
+        improve=not args.no_improve,
+        min_stake=parse_gp(args.min_stake),
     )
 
 
@@ -573,6 +588,57 @@ def _fmt_secs(s: float | None) -> str:
     return f"{s:.0f}s" if s < 90 else f"{s / 60:.1f}m" if s < 5400 else f"{s / 3600:.1f}h"
 
 
+def advice_path() -> Path:
+    return Path.home() / ".osrs-ge-analyser" / "advice.json"
+
+
+def cmd_advise(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
+    """Write the current top flips and remaining limits as JSON for the RuneLite plugin."""
+    out = Path(args.out).expanduser() if args.out else advice_path()
+    n = 0
+    while True:
+        now = int(time.time())
+        items = client.mapping()
+        latest = client.latest()
+        hour = client.hourly()
+        used = _used(args, ledger, now)
+        flips = find_flips(
+            items, latest, hour, budget=parse_gp(args.budget), now=now,
+            min_volume=args.min_volume, min_margin=args.min_margin, min_roi=args.min_roi / 100,
+            max_age_s=args.max_age * 60, members=_members_filter(args), used=used,
+            stats=_stats(args, client, items, now),
+        )[: args.top]
+        payload = {
+            "ts": now,
+            "budget": parse_gp(args.budget),
+            "flips": [
+                {
+                    "id": f.item.id, "name": f.item.name,
+                    "buy": f.buy + (1 if args.improve and f.margin > 2 else 0),
+                    "sell": f.sell - (1 if args.improve and f.margin > 2 else 0),
+                    "margin": f.margin - (2 if args.improve and f.margin > 2 else 0),
+                    "roi": round(f.roi, 4), "qty": f.quantity, "limit": f.item.limit, "limit_left": f.limit_left,
+                    "volume": f.liquidity, "fill": round(f.stats.p_fill, 3) if f.stats else None,
+                    "expect": f.expected_profit, "age": f.price_age_s,
+                }
+                for f in flips
+            ],
+            "limits": {
+                str(i): {"used": q, "limit": items[i].limit, "resets": ledger.resets_at(i, now)}
+                for i, q in used.items() if i in items
+            },
+        }
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(out)
+        n += 1
+        print(f"{time.strftime('%H:%M:%S')} wrote {len(flips)} flips to {out}", flush=True)
+        if args.ticks and n >= args.ticks:
+            break
+        time.sleep(args.interval)
+
+
 def cmd_sync(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
     now = int(time.time())
     paths: list[Path] = []
@@ -586,10 +652,12 @@ def cmd_sync(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
             sys.exit(f"Not found: {path}")
     if not args.paths:
         paths = runelite.account_files()
+        if runelite.plugin_log_path().exists():
+            paths.append(runelite.plugin_log_path())
     if not paths:
         sys.exit(
-            f"No Flipping Utilities data in {runelite.default_dir()}. Install 'Flipping Utilities' from the RuneLite "
-            "Plugin Hub, do some GE trades, then re-run; or pass an account .json path explicitly."
+            f"No trade data: neither {runelite.plugin_log_path()} (GE Analyser RuneLite plugin, see runelite-plugin/) nor "
+            f"{runelite.default_dir()} (Flipping Utilities from the Plugin Hub). Trade with one of them installed, then re-run."
         )
     trades = runelite.load_trades(paths)
     accounts = sorted({t.account for t in trades})
@@ -676,6 +744,17 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--max-age", type=int, default=60, help="ignore prices older than N minutes")
     f.set_defaults(func=cmd_flips)
 
+    a = sub.add_parser("advise", help="publish the current top flips + your remaining limits as JSON for the RuneLite plugin")
+    common(a)
+    a.add_argument("--min-margin", type=int, default=2, help="min per-unit profit after tax")
+    a.add_argument("--min-roi", type=float, default=2.0, help="min ROI percent")
+    a.add_argument("--max-age", type=int, default=60, help="ignore prices older than N minutes")
+    a.add_argument("--no-improve", dest="improve", action="store_false", help="quote exact instant prices instead of 1 gp better")
+    a.add_argument("--interval", type=int, default=60, help="seconds between refreshes (default 60)")
+    a.add_argument("--ticks", type=int, default=0, help="refreshes to run (0 = forever)")
+    a.add_argument("--out", help=f"output file (default ~/.osrs-ge-analyser/advice.json)")
+    a.set_defaults(func=cmd_advise)
+
     i = sub.add_parser("item", help="detail + trend for one item (name or id)")
     i.add_argument("query")
     i.set_defaults(func=cmd_item)
@@ -690,20 +769,26 @@ def build_parser() -> argparse.ArgumentParser:
     common(d)
     d.add_argument("--scan", type=int, default=60, help="how many of the most liquid items to fetch history for")
     d.add_argument("--z", type=float, default=1.0, help="min standard deviations below the mean")
+    d.add_argument("--include-shifts", action="store_true", help="also show items whose price has structurally re-levelled in the last week")
     d.set_defaults(func=cmd_dips)
 
+    def agent_args(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--budget", default="10k", help="starting cash (default 10k)")
+        sp.add_argument("--slots", type=int, default=None, help="GE slots (default 8, or 3 with --f2p)")
+        sp.add_argument("--min-volume", type=int, default=50, help="min two-sided units traded per hour")
+        sp.add_argument("--max-age", type=int, default=60, help="ignore prices older than N minutes (live mode)")
+        sp.add_argument("--fill-share", type=int, default=10, help="assume we capture 1/N of each window's volume (higher = more conservative)")
+        sp.add_argument("--loose", action="store_true", help="fill when the market touches our price instead of crossing it (optimistic)")
+        sp.add_argument("--min-margin", type=int, default=2, help="min per-unit profit after tax to enter a flip")
+        sp.add_argument("--min-roi", type=float, default=2.0, help="min ROI percent to enter a flip")
+        sp.add_argument("--no-improve", action="store_true", help="bid/ask exactly at the instant prices instead of 1 gp better (4x worse in backtests)")
+        sp.add_argument("--min-stake", default="0", help="gp per slot; use fewer slots until equity supports this many, e.g. 2500 (default off)")
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--f2p", action="store_true", help="free-to-play items only")
+        g.add_argument("--members", action="store_true", help="members items only")
+
     s = sub.add_parser("simulate", help="paper-trading agent: places and fills simulated offers from the flip ranking")
-    s.add_argument("--budget", default="10k", help="starting cash for a new simulation (default 10k)")
-    s.add_argument("--slots", type=int, default=None, help="GE slots (default 8, or 3 with --f2p)")
-    s.add_argument("--min-volume", type=int, default=50, help="min two-sided units traded per hour")
-    s.add_argument("--max-age", type=int, default=60, help="ignore prices older than N minutes (live mode)")
-    s.add_argument("--fill-share", type=int, default=10, help="assume we capture 1/N of each window's volume (higher = more conservative)")
-    s.add_argument("--loose", action="store_true", help="fill when the market touches our price instead of crossing it (optimistic)")
-    s.add_argument("--min-margin", type=int, default=2, help="min per-unit profit after tax to enter a flip")
-    s.add_argument("--min-roi", type=float, default=2.0, help="min ROI percent to enter a flip")
-    g = s.add_mutually_exclusive_group()
-    g.add_argument("--f2p", action="store_true", help="free-to-play items only")
-    g.add_argument("--members", action="store_true", help="members items only")
+    agent_args(s)
     s.add_argument("--interval", type=int, default=300, help="seconds between live ticks")
     s.add_argument("--ticks", type=int, default=1, help="live ticks to run (0 = forever)")
     s.add_argument("--backtest", type=float, metavar="HOURS", help="replay the last N hours of 5m history instead of trading live")
@@ -724,6 +809,12 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--days", type=float, default=None, help="history window (default 90 for market from 1h data, 30 for an item from 5m data)")
     k.set_defaults(func=cmd_peaks)
 
+    u = sub.add_parser("tune", help="walk-forward sweep of the scoring constants over several past windows")
+    agent_args(u)
+    u.add_argument("--folds", type=int, default=4, help="non-overlapping test windows, newest first (default 4)")
+    u.add_argument("--hours", type=float, default=72, help="length of each test window (default 72)")
+    u.set_defaults(func=cmd_tune)
+
     y = sub.add_parser("sync", help="import real trades from RuneLite Flipping Utilities: buy limits, P&L, fill times, model calibration")
     y.add_argument("paths", nargs="*", help="account .json files or directories (default ~/.runelite/flipping)")
     y.add_argument("--days", type=float, default=7, help="report window in days (default 7)")
@@ -732,6 +823,49 @@ def build_parser() -> argparse.ArgumentParser:
     y.add_argument("--max-items", type=int, default=40, help="calibrate: cap on distinct items to fetch history for")
     y.set_defaults(func=cmd_sync)
     return p
+
+
+def cmd_tune(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
+    store = HistoryStore()
+    need_days = (args.folds * args.hours) / 24 + args.history_days + 0.2
+    _top_up(store, client, need_days)
+    items = client.mapping()
+    cfg = _sim_config(args)
+    cfg.max_age = 10 * 60
+    cands = tune.grid()
+    budget = parse_gp(args.budget)
+    print(f"Walk-forward: {args.folds} folds x {args.hours:g}h, features from the {args.history_days:g} days before each fold, {len(cands)} candidates, start {fmt_gp(budget)}")
+    t0 = time.time()
+    results = tune.run(
+        store, items, cfg, budget, args.folds, args.hours, args.history_days, cands,
+        progress=lambda f, n, r: print(f"  fold {f} {n:<16} {r * 100:+8.1f}%   ({time.time() - t0:.0f}s)", file=sys.stderr, flush=True),
+    )
+    rows, best = tune.summarise(results, cands)
+    print()
+    print(
+        _table(
+            ["Candidate", "Older folds (mean)", "Rank", "Newest fold"],
+            [[n, f"{tr * 100:+.1f}%", str(rk), f"{te * 100:+.1f}%"] for n, tr, te, rk in rows],
+            right={1, 2, 3},
+        )
+    )
+    print("\nPer fold:")
+    print(
+        _table(
+            ["Fold", "Window", *[c.name for c in cands]],
+            [
+                [str(r.fold), f"{time.strftime('%m-%d %H:%M', time.localtime(r.start))} .. {time.strftime('%m-%d %H:%M', time.localtime(r.end))}", *[f"{r.returns[c.name] * 100:+.0f}%" for c in cands]]
+                for r in results
+            ],
+            right=set(range(2, 2 + len(cands))),
+        )
+    )
+    chosen = next(c for c in cands if c.name == best)
+    if best == "default":
+        print("\nRecommendation: keep the defaults; no candidate beats them out of sample.")
+    else:
+        print(f"\nRecommendation: {chosen.describe()} — best on the older folds and better than default on the newest one.")
+        print("Apply by editing ScoreParams defaults in ge_analyser/analysis.py (and SHRINK_WINDOWS in features.py).")
 
 
 def main(argv: list[str] | None = None) -> None:

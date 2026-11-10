@@ -17,6 +17,8 @@ Five commands:
 | `sync` | Imports your real trades from RuneLite's Flipping Utilities: fills the buy-limit ledger, reports FIFO P&L and fill times, calibrates the simulator's fill model. |
 | `history` | Backfills / tops up the local market history: 5m windows (30 d), 1h windows (365 d) and daily series (1 y) for every item. |
 | `peaks` | When the market, or one item, actually trades: volume / spread / fill rate by hour of day and weekday. |
+| `advise` | Publishes the current suggestions + your remaining limits as JSON every minute for the RuneLite panel. |
+| `tune` | Walk-forward sweep of the scoring constants; says whether anything beats the defaults out of sample. |
 
 No third-party dependencies; Python 3.10+.
 
@@ -94,10 +96,22 @@ ge-analyser simulate --reset      # start over
 ```
 
 Strategy: for each free slot, take the best-scoring flip the ranking produces with
-`budget = cash / free_slots`, bid at the current instant-sell price and, once filled,
-ask at the instant-buy price seen at fill time. Buys are cancelled after 30 min unfilled;
-sells are re-priced to the current instant-buy after 30 min and dumped at instant-sell
-after 90 min so nothing sits forever.
+`budget = cash / free_slots`, bid **1 gp above** the current instant-sell and, once
+filled, ask **1 gp below** the instant-buy seen at fill time — you are then the best
+offer on each side rather than one of many at the print (`--no-improve` to quote the
+exact prints; 4× worse in backtests: +1,935% vs +7,841% over the same 96h). Buys are
+cancelled after 30 min unfilled; sells are re-priced to the current instant-buy after
+30 min and dumped at instant-sell after 90 min so nothing sits forever. `--min-stake N`
+concentrates a small stack into fewer slots (neutral in backtests; off by default).
+
+`ge-analyser tune` runs a walk-forward sweep of the scoring constants (liquidity weight,
+volatility penalty, bucket shrinkage) over several past windows, ranks candidates on the
+older folds and confirms on the newest, and tells you whether anything beats the
+defaults out of sample.
+
+`dips` now consults the daily history: items whose last week sits ≥ 15% away from the
+prior two months on ≥ 5 of 7 days are structural re-levels (game updates), not dips, and
+are hidden unless you pass `--include-shifts`.
 
 Fill model (conservative by default, tunable):
 
@@ -115,11 +129,23 @@ and `--loose` as a ceiling nobody reaches.
 
 State lives in `~/.osrs-ge-analyser/sim.json` (override with `GE_ANALYSER_SIM`).
 
+## In-game panel (RuneLite plugin)
+
+`runelite-plugin/` is a small sideloadable RuneLite plugin: a side panel listing the
+current suggestions (item, buy→sell, margin, qty, remaining limit, fill probability) fed
+by `ge-analyser advise`, plus a recorder that logs your real GE offers for `sync`. It
+reads game state and draws; it never places offers. See `runelite-plugin/README.md`.
+
+```sh
+ge-analyser advise --budget 10m --top 15      # refreshes ~/.osrs-ge-analyser/advice.json every 60 s
+cd runelite-plugin && ./gradlew jar           # build/libs/ge-analyser-0.1.0.jar
+```
+
 ## Syncing real trades from RuneLite
 
-Install **Flipping Utilities** from the RuneLite Plugin Hub. It records every GE offer on
-your account (no automation; it only reads game state) to
-`~/.runelite/flipping/<DisplayName>.json`. Then:
+Either the bundled plugin above (writes `~/.osrs-ge-analyser/runelite-trades.jsonl`) or
+**Flipping Utilities** from the Plugin Hub (writes `~/.runelite/flipping/<DisplayName>.json`).
+Both only read game state. Then:
 
 ```sh
 ge-analyser sync                 # all accounts in ~/.runelite/flipping

@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .analysis import Flip, ItemStats, find_flips, ge_tax
+from .analysis import DEFAULT_PARAMS, Flip, ItemStats, ScoreParams, find_flips, ge_tax
 from .api import ItemInfo, LatestPrice, WindowPrice
 
 
@@ -84,6 +84,9 @@ class Config:
     strict: bool = True  # fills need the market to cross our price, not just touch it
     min_margin: int = 2  # gp per unit after tax; 1-gp spreads are bot territory
     min_roi: float = 0.02
+    improve: bool = True  # bid 1 gp above instant-sell / ask 1 gp below instant-buy: you become the best offer
+    min_stake: int = 0  # gp per slot; fewer slots are used until equity supports this many (0 = off)
+    score: ScoreParams = DEFAULT_PARAMS
 
 
 @dataclass
@@ -133,6 +136,13 @@ class State:
         return slots - len(self.orders)
 
 
+def slots_for(cash_plus_positions: int, slots: int, min_stake: int) -> int:
+    """Concentrate a small stack: never spread equity thinner than `min_stake` per slot."""
+    if min_stake <= 0:
+        return slots
+    return max(1, min(slots, cash_plus_positions // min_stake))
+
+
 class Simulator:
     def __init__(self, state: State, items: dict[int, ItemInfo], config: Config) -> None:
         self.state = state
@@ -140,6 +150,11 @@ class Simulator:
         self.cfg = config
         # Per-item history features for a given moment (time-of-week aware); None = legacy scoring.
         self.stats_at: Callable[[int], dict[int, ItemStats]] | None = None
+
+    def usable_slots(self) -> int:
+        # Equity proxy without a snapshot: cash + reserved + positions at cost.
+        equity = self.state.cash + self.state.reserved() + sum(o.cost_basis * o.remaining for o in self.state.orders if o.kind == "sell")
+        return slots_for(equity, self.cfg.slots, self.cfg.min_stake)
 
     # ---- helpers -------------------------------------------------------
     def _log(self, now: int, msg: str) -> None:
@@ -189,6 +204,8 @@ class Simulator:
         price = o.price
         self.state.trades.append(Trade(now, "buy", o.item_id, o.name, qty, price, 0, 0))
         ask = tick.high if tick.high and tick.high > price else price + 1
+        if self.cfg.improve and ask - 1 > price:
+            ask -= 1
         self._list_for_sale(self.items[o.item_id], qty, price, ask, now)
         self._log(now, f"BUY  {qty:,} x {o.name} @ {price:,} -> listing @ {ask:,}")
         if o.remaining == 0:
@@ -246,7 +263,7 @@ class Simulator:
 
     # ---- decisions -----------------------------------------------------
     def decide(self, latest: dict[int, LatestPrice], hour: dict[int, WindowPrice], now: int) -> list[Order]:
-        free = self.state.open_slots(self.cfg.slots)
+        free = self.state.open_slots(self.usable_slots())
         if free <= 0 or self.state.cash <= 0:
             return []
         active = {o.item_id for o in self.state.orders}
@@ -263,6 +280,7 @@ class Simulator:
             max_age_s=self.cfg.max_age,
             members=self.cfg.members,
             stats=self.stats_at(now) if self.stats_at else None,
+            params=self.cfg.score,
             used=self.used_limits(now),
         )
         placed: list[Order] = []
@@ -271,14 +289,20 @@ class Simulator:
                 break
             if f.item.id in active:
                 continue
-            qty = min(f.quantity, self.state.cash // f.buy)
-            if qty <= 0 or f.margin * qty <= 0:
+            bid, target = f.buy, f.sell
+            if self.cfg.improve:
+                # Jump the queue by 1 gp on each leg if the margin survives it.
+                improved_margin = (f.sell - 1) - ge_tax(f.sell - 1, f.item.name) - (f.buy + 1)
+                if improved_margin >= max(self.cfg.min_margin, 1):
+                    bid, target = f.buy + 1, f.sell - 1
+            qty = min(f.quantity, self.state.cash // bid)
+            if qty <= 0:
                 continue
-            self.state.cash -= f.buy * qty
-            placed.append(self._new_order("buy", f.item, f.buy, qty, now))
+            self.state.cash -= bid * qty
+            placed.append(self._new_order("buy", f.item, bid, qty, now))
             active.add(f.item.id)
             free -= 1
-            self._log(now, f"OFFER buy {qty:,} x {f.item.name} @ {f.buy:,} (target {f.sell:,}, margin {f.margin:,}/unit)")
+            self._log(now, f"OFFER buy {qty:,} x {f.item.name} @ {bid:,} (target {target:,}, margin {target - ge_tax(target, f.item.name) - bid:,}/unit)")
         return placed
 
     # ---- one full step -------------------------------------------------
@@ -337,3 +361,30 @@ def hour_from_history(history: Iterable[Snapshot]) -> dict[int, WindowPrice]:
             hv[i] = hv.get(i, 0) + t.high_volume
             lv[i] = lv.get(i, 0) + t.low_volume
     return {i: WindowPrice(None, hv[i], None, lv.get(i, 0)) for i in hv}
+
+
+def replay(
+    windows: Iterable[tuple[int, dict[int, dict]]],
+    items: dict[int, ItemInfo],
+    cfg: Config,
+    budget: int,
+    start: int,
+    stats_at: Callable[[int], dict[int, ItemStats]] | None,
+) -> tuple[State, Snapshot, int]:
+    """Replay 5m windows (ts, raw rows) in time order. Windows before `start` only warm
+    up the hourly-volume history; decisions begin at `start`."""
+    state = State(start_cash=budget, cash=budget)
+    sim = Simulator(state, items, cfg)
+    sim.stats_at = stats_at
+    history: list[Snapshot] = []
+    snap: Snapshot = {}
+    replayed = 0
+    for ts, bucket in windows:
+        snap = snapshot_from_buckets(bucket, ts)
+        history.append(snap)
+        del history[:-12]
+        if ts < start:
+            continue
+        sim.step(snap, latest_from_snapshot(snap), hour_from_history(history), ts)
+        replayed += 1
+    return state, snap, replayed
