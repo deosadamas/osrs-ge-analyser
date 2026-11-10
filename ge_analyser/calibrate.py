@@ -123,12 +123,17 @@ class Calibration:
         return "mixed -> strict model is a fair floor; reality sits between strict and --loose"
 
 
-def step_for_age(age_s: int) -> str:
-    if age_s < 28 * 3600:
-        return "5m"
-    if age_s < 14 * 86400:
-        return "1h"
-    return "6h"
+def lookback_for_age(age_s: int) -> str:
+    """Smallest wiki lookback whose history covers a trade this old (finer step = better match)."""
+    if age_s < 23 * 3600:
+        return "24h"
+    if age_s < 6.5 * 86400:
+        return "7d"
+    if age_s < 29 * 86400:
+        return "30d"
+    if age_s < 180 * 86400:
+        return "6m"
+    return "1y"
 
 
 def bucket_at(series: list[dict[str, Any]], ts: int) -> dict[str, Any] | None:
@@ -146,7 +151,7 @@ def calibrate(trades: list[RealTrade], history: dict[tuple[int, str], list[dict[
     for t in trades:
         if t.state not in ("BOUGHT", "SOLD"):
             continue
-        series = history.get((t.item_id, step_for_age(now - t.ts)))
+        series = history.get((t.item_id, lookback_for_age(now - t.ts)))
         b = bucket_at(series, t.ts) if series else None
         market = (b or {}).get("avgLowPrice" if t.buy else "avgHighPrice")
         if not market:

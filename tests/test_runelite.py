@@ -4,7 +4,7 @@ written; if a real file breaks parse_account, add it as a fixture here."""
 
 import json
 
-from ge_analyser.calibrate import bucket_at, calibrate, fifo_pnl, fill_stats, step_for_age
+from ge_analyser.calibrate import bucket_at, calibrate, fifo_pnl, fill_stats, lookback_for_age
 from ge_analyser.ledger import Ledger, Purchase
 from ge_analyser.runelite import account_files, parse_account, parse_instant
 
@@ -142,8 +142,8 @@ def test_calibration_classifies_against_wiki_print():
 
     series = [{"timestamp": NOW - 600, "avgLowPrice": 100, "avgHighPrice": 110}, {"timestamp": NOW - 300, "avgLowPrice": 98, "avgHighPrice": 112}]
     assert bucket_at(series, NOW - 400)["avgLowPrice"] == 100
-    assert step_for_age(3600) == "5m" and step_for_age(3 * 86400) == "1h" and step_for_age(30 * 86400) == "6h"
-    history = {(1, "5m"): series}
+    assert lookback_for_age(3600) == "24h" and lookback_for_age(3 * 86400) == "7d" and lookback_for_age(20 * 86400) == "30d"
+    history = {(1, "24h"): series}
     trades = [
         rt(True, 97, NOW - 200, "BOUGHT"),  # paid below instant-sell 98 -> strict fill
         rt(True, 100, NOW - 200, "BOUGHT"),  # at/above -> loose fill

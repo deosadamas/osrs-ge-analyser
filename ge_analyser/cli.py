@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .analysis import (
     Flip,
+    ItemStats,
     find_flips,
     fmt_gp,
     ge_tax,
@@ -25,7 +26,9 @@ from .analysis import (
     trend_from_timeseries,
 )
 from .api import GEClient, ItemInfo
-from .calibrate import calibrate, fifo_pnl, fill_stats, step_for_age
+from .calibrate import calibrate, fifo_pnl, fill_stats, lookback_for_age
+from .features import cached_stats, compute_stats
+from .history import HistoryStore
 from .ledger import Ledger, Purchase
 from . import runelite
 from .sim import (
@@ -60,8 +63,10 @@ def _age(seconds: int) -> str:
 
 
 def _print_flips(flips: list[Flip]) -> None:
-    rows = [
-        [
+    with_stats = any(f.stats for f in flips)
+    rows = []
+    for f in flips:
+        row = [
             f.item.name,
             fmt_gp(f.buy),
             fmt_gp(f.sell),
@@ -71,17 +76,20 @@ def _print_flips(flips: list[Flip]) -> None:
             f"{f.hourly_volume:,}",
             f"{f.quantity:,}",
             fmt_gp(f.profit),
-            _age(f.price_age_s),
         ]
-        for f in flips
-    ]
-    print(
-        _table(
-            ["Item", "Buy", "Sell", "Margin", "ROI", "Limit", "Vol/h", "Qty", "Profit", "Age"],
-            rows,
-            right={1, 2, 3, 4, 5, 6, 7, 8, 9},
-        )
-    )
+        if with_stats:
+            s = f.stats
+            if s is None or s.windows == 0:
+                row += ["?", "?", "?", fmt_gp(f.expected_profit)]
+            else:
+                row += [f"{s.p_fill * 100:.0f}%", fmt_gp(s.median_margin), f"{s.volatility_pct:.1f}%", fmt_gp(f.expected_profit)]
+        row.append(_age(f.price_age_s))
+        rows.append(row)
+    headers = ["Item", "Buy", "Sell", "Margin", "ROI", "Limit", "Vol/h", "Qty", "Profit"]
+    if with_stats:
+        headers += ["Fill", "Typ", "Vol", "Expect"]
+    headers.append("Age")
+    print(_table(headers, rows, right=set(range(1, len(headers)))))
 
 
 def _find_item(items: dict[int, ItemInfo], query: str) -> ItemInfo:
@@ -111,6 +119,21 @@ def _used(args: argparse.Namespace, ledger: Ledger, now: int) -> dict[int, int]:
     return {} if args.ignore_ledger else ledger.used(now)
 
 
+def _top_up(store: HistoryStore, client: GEClient, days: float) -> int:
+    missing = len(store.missing(int(time.time()) - int(days * 86400), int(time.time()) - 300))
+    if missing > 30:
+        print(f"Fetching {missing} 5-minute windows of history (one-off; later runs top up incrementally)...", file=sys.stderr)
+    return store.update(client, days)
+
+
+def _stats(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], now: int) -> dict[int, ItemStats] | None:
+    if args.no_stats:
+        return None
+    store = HistoryStore()
+    _top_up(store, client, args.history_days)
+    return cached_stats(store, {i: it.name for i, it in items.items()}, args.history_days, now)
+
+
 def cmd_flips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
     now = int(time.time())
     items = client.mapping()
@@ -128,6 +151,7 @@ def cmd_flips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> Non
         max_age_s=args.max_age * 60,
         members=_members_filter(args),
         used=_used(args, ledger, now),
+        stats=_stats(args, client, items, now),
     )
     if not flips:
         ages = [now - min(p.high_time, p.low_time) for p in latest.values() if p.high_time and p.low_time]
@@ -140,6 +164,8 @@ def cmd_flips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> Non
     _print_flips(flips[: args.top])
     print("\nBuy = place buy offer at this price; Sell = place sell offer at this price. Margin is after 2% GE tax.")
     print("Limit = units still buyable this 4h window; record purchases with `ge-analyser bought <item> <qty>`.")
+    if any(f.stats for f in flips):
+        print("Fill = P(both legs cross within 30 min) from history; Typ = typical after-tax margin; Vol = 5m volatility; Expect = Typ x Qty x Fill.")
 
 
 def cmd_bought(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
@@ -203,8 +229,15 @@ def cmd_item(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
     if hour:
         print(f"  Last hour: {hour.high_volume:,} bought @ avg {fmt_gp(hour.avg_high or 0)}, {hour.low_volume:,} sold @ avg {fmt_gp(hour.avg_low or 0)}")
 
-    for step, label in (("1h", "24h (1h candles)"), ("6h", "~3 months (6h candles)")):
-        trend = trend_from_timeseries(client.timeseries(item.id, step))
+    st = (_stats(args, client, items, now) or {}).get(item.id)
+    if st:
+        print(
+            f"  History ({args.history_days:g}d, {st.windows} windows): fill P(buy) {st.fill_buy * 100:.0f}%  P(sell) {st.fill_sell * 100:.0f}%  "
+            f"typical margin {fmt_gp(st.median_margin)}  5m volatility {st.volatility_pct:.2f}%"
+        )
+
+    for lookback, label in (("24h", "24h (5m candles)"), ("30d", "30 days (1h candles)"), ("6m", "6 months (6h candles)")):
+        trend = trend_from_timeseries(client.timeseries(item.id, lookback))
         if trend is None:
             continue
         signal = "BUY (below average)" if trend.z_score < -1 else "SELL (above average)" if trend.z_score > 1 else "neutral"
@@ -236,7 +269,7 @@ def cmd_dips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
 
     rows = []
     for _, item, lp in candidates:
-        trend = trend_from_timeseries(client.timeseries(item.id, "1h"))
+        trend = trend_from_timeseries(client.timeseries(item.id, "24h"))
         if trend is None or trend.z_score > -args.z:
             continue
         upside = trend.mean - lp.low
@@ -328,6 +361,7 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
         now = int(time.time())
         latest, five, hour = client.latest(), client.window("5m"), client.hourly()
         snap = snapshot_from_live(latest, five)
+        sim.stats = _stats(args, client, items, now)
         sim.step(snap, latest, hour, now)
         state.save(path)
         print(f"--- {time.strftime('%H:%M:%S', time.localtime(now))} ---")
@@ -338,41 +372,65 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
     print(f"\nState saved to {path}. Resume with `ge-analyser simulate --ticks N`, inspect with --status.")
 
 
-def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], cfg: Config) -> None:
-    budget = parse_gp(args.budget)
-    hour = client.hourly()
-    liquid = sorted(
-        (i for i, w in hour.items() if i in items and (cfg.members is None or items[i].members == cfg.members)),
-        key=lambda i: min(hour[i].high_volume, hour[i].low_volume),
-        reverse=True,
-    )[: args.scan]
-    print(f"Backtest: {args.backtest:g}h of 5m history, {len(liquid)} most liquid items, start {fmt_gp(budget)}, {cfg.slots} slots")
-
-    by_ts: dict[int, dict[int, dict]] = {}
-    for item_id in liquid:
-        for b in client.timeseries(item_id, "5m"):
-            by_ts.setdefault(b["timestamp"], {})[item_id] = b
-    timestamps = sorted(by_ts)
-    if not timestamps:
-        sys.exit("No history returned.")
-    start_ts = timestamps[-1] - int(args.backtest * 3600)
-    # Keep one hour of warm-up buckets so hourly volume is populated at the first decision.
-    warmup = [ts for ts in timestamps if ts < start_ts][-12:]
-    run = [ts for ts in timestamps if ts >= start_ts]
-
+def _run_backtest(
+    store: HistoryStore,
+    items: dict[int, ItemInfo],
+    cfg: Config,
+    budget: int,
+    start: int,
+    end: int,
+    stats: dict[int, ItemStats] | None,
+) -> tuple[State, Snapshot, int]:
     state = State(start_cash=budget, cash=budget)
-    cfg.max_age = 10 * 60  # buckets are always fresh relative to their own timestamp
     sim = Simulator(state, items, cfg)
-    history: list[Snapshot] = [snapshot_from_buckets(by_ts[ts], ts) for ts in warmup]
+    sim.stats = stats
+    history: list[Snapshot] = []
     snap: Snapshot = {}
-    for ts in run:
-        snap = snapshot_from_buckets(by_ts[ts], ts)
+    replayed = 0
+    for ts, bucket in store.windows(start - 3600, end + 1):
+        snap = snapshot_from_buckets(bucket, ts)
         history.append(snap)
         del history[:-12]
+        if ts < start:
+            continue  # warm-up: populates hourly volume before the first decision
         sim.step(snap, latest_from_snapshot(snap), hour_from_history(history), ts)
-    # Mark-to-market any leftovers at the final print.
-    print(f"Replayed {len(run)} buckets from {time.strftime('%m-%d %H:%M', time.localtime(run[0]))} to {time.strftime('%m-%d %H:%M', time.localtime(run[-1]))}\n")
-    _print_sim(state, snap, run[-1], tail=25)
+        replayed += 1
+    return state, snap, replayed
+
+
+def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], cfg: Config) -> None:
+    budget = parse_gp(args.budget)
+    store = HistoryStore()
+    need_days = args.backtest / 24 + args.history_days + 0.1
+    _top_up(store, client, need_days)
+    _, last, _ = store.coverage()
+    if last is None:
+        sys.exit("No history available.")
+    end = last
+    start = end - int(args.backtest * 3600)
+    names = {i: it.name for i, it in items.items()}
+    # Features come only from windows *before* the replay starts: no look-ahead.
+    stats = None if args.no_stats else compute_stats(store, names, start - int(args.history_days * 86400), start)
+    cfg.max_age = 10 * 60  # buckets are always fresh relative to their own timestamp
+    span = f"{time.strftime('%m-%d %H:%M', time.localtime(start))} to {time.strftime('%m-%d %H:%M', time.localtime(end))}"
+    print(f"Backtest: {args.backtest:g}h of 5m history ({span}), all items, start {fmt_gp(budget)}, {cfg.slots} slots")
+    if stats is not None:
+        print(f"Scoring with history features for {len(stats)} items ({args.history_days:g} days before the replay)")
+
+    if args.compare:
+        rows = []
+        for label, st in (("history features", stats), ("legacy (no history)", None)):
+            state, snap, _ = _run_backtest(store, items, cfg, budget, start, end, st)
+            eq = state.equity(snap)
+            sells = [t for t in state.trades if t.kind == "sell"]
+            rows.append([label, fmt_gp(eq), f"{eq - budget:+,}", f"{(eq - budget) / budget * 100:+.1f}%", str(len(sells)), str(sum(1 for t in sells if t.profit > 0))])
+        print()
+        print(_table(["Scoring", "Equity", "P&L", "Return", "Sells", "Wins"], rows, right={1, 2, 3, 4, 5}))
+        return
+
+    state, snap, replayed = _run_backtest(store, items, cfg, budget, start, end, stats)
+    print(f"Replayed {replayed} buckets\n")
+    _print_sim(state, snap, end, tail=25)
     sells = [t for t in state.trades if t.kind == "sell"]
     if sells:
         by_item: dict[str, int] = {}
@@ -381,6 +439,17 @@ def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemI
         ranked = sorted(by_item.items(), key=lambda kv: kv[1], reverse=True)
         print("\nRealised P&L by item:")
         print(_table(["Item", "Profit"], [[n, f"{p:+,}"] for n, p in ranked], right={1}))
+
+
+def cmd_history(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
+    store = HistoryStore()
+    fetched = _top_up(store, client, args.days)
+    first, last, n = store.coverage()
+    if first is None:
+        print("History is empty.")
+        return
+    span = f"{time.strftime('%m-%d %H:%M', time.localtime(first))} .. {time.strftime('%m-%d %H:%M', time.localtime(last))}"
+    print(f"Fetched {fetched} new window(s). Store has {n:,} windows ({span}) at {store.path}")
 
 
 def _fmt_secs(s: float | None) -> str:
@@ -453,7 +522,7 @@ def cmd_sync(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
 
     # 3. Calibration against the wiki print.
     if args.calibrate:
-        items = sorted({(t.item_id, step_for_age(now - t.ts)) for t in completed})
+        items = sorted({(t.item_id, lookback_for_age(now - t.ts)) for t in completed})
         distinct = {i for i, _ in items}
         if len(distinct) > args.max_items:
             keep = set(sorted(distinct, key=lambda i: -sum(t.qty * t.price for t in completed if t.item_id == i))[: args.max_items])
@@ -473,6 +542,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ge-analyser", description="OSRS Grand Exchange flip & trend analyser")
     p.add_argument("--no-cache", action="store_true", help="bypass the local response cache")
     p.add_argument("--ignore-ledger", action="store_true", help="assume fresh buy limits, ignoring recorded purchases")
+    p.add_argument("--no-stats", action="store_true", help="legacy scoring: ignore the local price history")
+    p.add_argument("--history-days", type=float, default=3, help="days of 5m history used for per-item fill/margin/volatility stats (default 3)")
     sub = p.add_subparsers(dest="command", required=True)
 
     def common(sp: argparse.ArgumentParser) -> None:
@@ -521,10 +592,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=int, default=300, help="seconds between live ticks")
     s.add_argument("--ticks", type=int, default=1, help="live ticks to run (0 = forever)")
     s.add_argument("--backtest", type=float, metavar="HOURS", help="replay the last N hours of 5m history instead of trading live")
-    s.add_argument("--scan", type=int, default=40, help="backtest: number of most-liquid items to replay")
+    s.add_argument("--compare", action="store_true", help="backtest: run with and without history features and compare")
     s.add_argument("--status", action="store_true", help="show the live simulation portfolio and exit")
     s.add_argument("--reset", action="store_true", help="delete the live simulation state")
     s.set_defaults(func=cmd_simulate)
+
+    h = sub.add_parser("history", help="backfill / top up the local 5-minute market history (all items)")
+    h.add_argument("--days", type=float, default=7, help="how far back to ensure coverage (default 7)")
+    h.set_defaults(func=cmd_history)
 
     y = sub.add_parser("sync", help="import real trades from RuneLite Flipping Utilities: buy limits, P&L, fill times, model calibration")
     y.add_argument("paths", nargs="*", help="account .json files or directories (default ~/.runelite/flipping)")

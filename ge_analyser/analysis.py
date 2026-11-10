@@ -80,6 +80,25 @@ def ge_tax(sell_price: int, item_name: str = "") -> int:
 
 
 @dataclass(frozen=True)
+class ItemStats:
+    """Per-item features from recent 5m history (see features.compute_stats)."""
+
+    windows: int  # 5m windows with both a buy and a sell print
+    fill_buy: float  # P(a bid at the window's instant-sell is crossed within 30 min)
+    fill_sell: float  # P(an ask at the window's instant-buy is crossed within 30 min)
+    median_margin: int  # median after-tax spread per unit across windows
+    volatility_pct: float  # std-dev of 5m mid-price % changes
+
+    @property
+    def p_fill(self) -> float:
+        return self.fill_buy * self.fill_sell
+
+
+# Used when history is enabled but an item has too few two-sided 5m windows to measure:
+# such items are illiquid, so assume both legs rarely fill and trust today's margin.
+UNKNOWN_STATS = ItemStats(windows=0, fill_buy=0.1, fill_sell=0.1, median_margin=0, volatility_pct=0.0)
+
+@dataclass(frozen=True)
 class Flip:
     item: ItemInfo
     buy: int  # price to place buy offer at (current instant-sell price)
@@ -93,6 +112,8 @@ class Flip:
     profit: int  # margin * quantity
     price_age_s: int  # seconds since the older of the two latest prices
     score: float
+    stats: ItemStats | None = None  # per-item history features when available
+    expected_profit: int = 0  # profit x fill probability on the typical margin (= profit without stats)
 
 
 def remaining_limit(item: ItemInfo, used: int) -> int:
@@ -118,6 +139,7 @@ def evaluate_flip(
     budget: int,
     now: int,
     used: int = 0,
+    stats: ItemStats | None = None,
 ) -> Flip | None:
     if latest.high is None or latest.low is None or latest.high_time is None or latest.low_time is None:
         return None
@@ -135,10 +157,20 @@ def evaluate_flip(
     profit = margin * qty
     roi = margin / buy
     age = now - min(latest.high_time, latest.low_time)
-    # Score: profit per cycle, discounted by staleness and rewarding liquidity.
     staleness = 1.0 / (1.0 + age / 3600)
     liquidity = math.log1p(hourly_volume)
-    score = profit * staleness * (0.5 + liquidity / 10)
+    if stats is None:
+        # No history: profit per cycle, discounted by staleness, rewarding liquidity.
+        expected = profit
+        score = profit * staleness * (0.5 + liquidity / 10)
+    else:
+        # With history: expected profit = typical margin (not today's spike) x units x
+        # probability both legs fill, then penalised when 5m volatility rivals the margin.
+        typical = margin if stats.windows == 0 else stats.median_margin
+        edge = max(min(margin, typical), 1)
+        expected = int(edge * qty * stats.p_fill)
+        risk = 1.0 / (1.0 + stats.volatility_pct / max(roi * 100, 0.01))
+        score = expected * staleness * (0.5 + liquidity / 10) * risk
     return Flip(
         item=item,
         buy=buy,
@@ -152,6 +184,8 @@ def evaluate_flip(
         profit=profit,
         price_age_s=age,
         score=score,
+        stats=stats,
+        expected_profit=expected,
     )
 
 
@@ -167,6 +201,7 @@ def find_flips(
     max_age_s: int = 3600,
     members: bool | None = None,
     used: dict[int, int] | None = None,
+    stats: dict[int, ItemStats] | None = None,
 ) -> list[Flip]:
     used = used or {}
     out: list[Flip] = []
@@ -176,7 +211,8 @@ def find_flips(
             continue
         if members is not None and item.members != members:
             continue
-        flip = evaluate_flip(item, price, hour.get(item_id), budget, now, used.get(item_id, 0))
+        item_stats = None if stats is None else stats.get(item_id, UNKNOWN_STATS)
+        flip = evaluate_flip(item, price, hour.get(item_id), budget, now, used.get(item_id, 0), item_stats)
         if flip is None:
             continue
         if flip.hourly_volume < min_volume or flip.margin < min_margin:

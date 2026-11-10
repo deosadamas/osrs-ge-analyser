@@ -1,6 +1,7 @@
 # osrs-ge-analyser
 
-Grand Exchange analyser for Old School RuneScape. Pulls live prices from the
+Grand Exchange analyser for Old School RuneScape. Pulls live prices and a local history
+of 5-minute market windows from the
 [OSRS Wiki real-time prices API](https://oldschool.runescape.wiki/w/RuneScape:Real-time_Prices)
 and tells you what to buy and sell.
 
@@ -143,18 +144,55 @@ The schema is taken from the plugin's source (Gson field names `b`, `id`, `cQIT`
 `t`, `st`, `tSFO` …). It was verified against a synthetic file, not a real export — if a
 real file fails to parse, open an issue with the file attached.
 
-## How ranking works
+## Local market history and how ranking works
 
-`score = profit × 1/(1 + age_hours) × (0.5 + ln(1 + volume)/10)`
+Every command that ranks items keeps a local SQLite store of **5-minute windows for all
+items**, pulled from the wiki's bulk `/5m?timestamp=` endpoint (one request per window,
+all ~2,000 traded items at once). First run fetches the last 3 days (~860 requests, ~1
+min); afterwards each run tops up only the windows it is missing.
 
-Profit per cycle, discounted for stale prices, boosted for liquidity. The constants are
-in `ge_analyser/analysis.py::evaluate_flip`.
+```sh
+ge-analyser history --days 7     # backfill / inspect coverage
+ge-analyser --history-days 7 flips   # use a week of history for the stats
+ge-analyser --no-stats flips         # legacy scoring without history
+```
+
+From that history, three per-item features are computed (cached for 30 min):
+
+| Feature | Question it answers |
+|---|---|
+| `fill_buy`, `fill_sell` | In the last N days, how often did a bid at a window's instant-sell get **crossed** by a later window within 30 min (and likewise an ask at the instant-buy)? Same rule the simulator uses, so `Fill = fill_buy × fill_sell` is its round-trip fill probability. |
+| `median_margin` (`Typ`) | The typical after-tax spread. Today's margin above it is treated as a spike and capped. |
+| `volatility_pct` (`Vol`) | Std-dev of 5m mid-price moves. A margin smaller than this is noise. |
+
+Score with history: `Expect = min(margin, Typ) × Qty × Fill`, then
+`score = Expect × 1/(1 + age_h) × (0.5 + ln(1 + vol/h)/10) × 1/(1 + Vol% / ROI%)`.
+Items with fewer than 12 two-sided windows in the period get `Fill = 1%` (they are
+illiquid by definition) and sink. Without history (`--no-stats`) the legacy score is
+`profit × staleness × liquidity`.
+
+Does it help? Same strict fill model, same 10k start, all items, features computed only
+from windows *before* each replay (`simulate --backtest H --compare`):
+
+| Horizon | History features | Legacy | Win rate (hist / legacy) |
+|---|---|---|---|
+| 24h | +119% | +81% | 61% / 47% |
+| 48h | +533% | +696% | 62% / 51% |
+| 72h | +1,507% | +594% | 60% / 43% |
+| 96h | +1,874% | +506% | 68% / 60% |
+| 72h, F2P, 3 slots | +159% | +26% | 57% / 48% |
+
+Four of five horizons favour the features and the win rate is higher in all of them.
+Absolute returns are backtest numbers on a tiny stack and compound; read the ratio, not
+the magnitude.
+
 
 ## Caching
 
-Responses are cached in `.cache/` (60 s for prices, 5 min for timeseries, 24 h for item
-mapping). `--no-cache` bypasses it. Be polite: the wiki asks for a descriptive
-User-Agent, set in `ge_analyser/api.py`.
+Live responses are cached in `.cache/` (60 s for prices, 5 min for timeseries, 24 h for
+item mapping); `--no-cache` bypasses it. Market history lives in
+`~/.osrs-ge-analyser/history.db` (override `GE_ANALYSER_HISTORY`). The wiki asks only for
+a descriptive User-Agent, set in `ge_analyser/api.py`; the client uses the v2 API.
 
 ## Development
 

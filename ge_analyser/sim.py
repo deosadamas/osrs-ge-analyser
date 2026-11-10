@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from .analysis import Flip, find_flips, ge_tax
+from .analysis import Flip, ItemStats, find_flips, ge_tax
 from .api import ItemInfo, LatestPrice, WindowPrice
 
 
@@ -138,6 +138,7 @@ class Simulator:
         self.state = state
         self.items = items
         self.cfg = config
+        self.stats: dict[int, ItemStats] | None = None  # per-item history features; None = legacy scoring
 
     # ---- helpers -------------------------------------------------------
     def _log(self, now: int, msg: str) -> None:
@@ -260,6 +261,7 @@ class Simulator:
             min_roi=self.cfg.min_roi,
             max_age_s=self.cfg.max_age,
             members=self.cfg.members,
+            stats=self.stats,
             used=self.used_limits(now),
         )
         placed: list[Order] = []

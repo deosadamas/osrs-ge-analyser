@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-BASE_URL = "https://prices.runescape.wiki/api/v1/osrs"
+BASE_URL = "https://prices.runescape.wiki/api/v2/osrs"
 USER_AGENT = "osrs-ge-analyser/0.1 (https://github.com/deosadamas/osrs-ge-analyser)"
+LOOKBACKS = frozenset({"6h", "24h", "7d", "30d", "6m", "1y"})
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,20 @@ class WindowPrice:
     high_volume: int
     avg_low: int | None
     low_volume: int
+
+
+def price_int(x: Any) -> int | None:
+    """v2 averages are floats with 2 decimals; GE prices are whole gp."""
+    return None if x is None else int(round(x))
+
+
+def window_price(row: dict[str, Any]) -> WindowPrice:
+    return WindowPrice(
+        avg_high=price_int(row.get("avgHighPrice")),
+        high_volume=row.get("highPriceVolume") or 0,
+        avg_low=price_int(row.get("avgLowPrice")),
+        low_volume=row.get("lowPriceVolume") or 0,
+    )
 
 
 class GEClient:
@@ -97,15 +112,7 @@ class GEClient:
         if step not in ("5m", "1h"):
             raise ValueError("step must be '5m' or '1h'")
         raw = self._get(step)["data"]
-        return {
-            int(item_id): WindowPrice(
-                avg_high=row.get("avgHighPrice"),
-                high_volume=row.get("highPriceVolume") or 0,
-                avg_low=row.get("avgLowPrice"),
-                low_volume=row.get("lowPriceVolume") or 0,
-            )
-            for item_id, row in raw.items()
-        }
+        return {int(item_id): window_price(row) for item_id, row in raw.items()}
 
     def hourly(self) -> dict[int, WindowPrice]:
         """Hourly volume robust to feed gaps.
@@ -129,8 +136,18 @@ class GEClient:
             )
         return out
 
-    def timeseries(self, item_id: int, step: str = "1h") -> list[dict[str, Any]]:
-        """Up to 365 data points for one item. step: 5m, 1h, 6h, 24h."""
-        if step not in ("5m", "1h", "6h", "24h"):
-            raise ValueError("step must be one of 5m, 1h, 6h, 24h")
-        return self._get(f"timeseries?timestep={step}&id={item_id}", ttl=300)["data"]
+    def timeseries(self, item_id: int, lookback: str = "24h") -> list[dict[str, Any]]:
+        """Price/volume history for one item. lookback: 6h, 24h, 7d, 30d, 6m, 1y.
+        The step is chosen by the server (5m for <=24h, 1h for 7d, 6h for 6m, 24h for 1y)."""
+        if lookback not in LOOKBACKS:
+            raise ValueError(f"lookback must be one of {sorted(LOOKBACKS)}")
+        return self._get(f"timeseries?lookback={lookback}&id={item_id}", ttl=300)["data"]
+
+    def window_at(self, step: str, ts: int) -> dict[int, dict[str, Any]]:
+        """All items' aggregates for the 5m or 1h window starting at `ts` (aligned).
+        Returns raw rows {avgHighPrice, highPriceVolume, avgLowPrice, lowPriceVolume}.
+        Past windows never change, so they are cached for a long time."""
+        if step not in ("5m", "1h"):
+            raise ValueError("step must be '5m' or '1h'")
+        raw = self._get(f"{step}?timestamp={ts}", ttl=0)["data"]
+        return {int(k): v for k, v in raw.items()}
