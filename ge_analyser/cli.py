@@ -387,11 +387,21 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
         return
 
     n = 0
+    failures = 0
     while args.ticks == 0 or n < args.ticks:
         now = int(time.time())
-        latest, five, hour = client.latest(), client.window("5m"), client.hourly()
-        snap = snapshot_from_live(latest, five)
-        timed = _timed_stats(args, client, items, now)
+        try:
+            latest, five, hour = client.latest(), client.window("5m"), client.hourly()
+            snap = snapshot_from_live(latest, five)
+            timed = _timed_stats(args, client, items, now)
+        except (OSError, ValueError, KeyError) as e:
+            # Wiki hiccup (closed connection, timeout, bad JSON): skip this tick, keep state.
+            failures += 1
+            wait = min(args.interval * failures, 600)
+            print(f"--- {time.strftime('%H:%M:%S', time.localtime(now))} fetch failed ({type(e).__name__}: {e}); retrying in {wait}s", flush=True)
+            time.sleep(wait)
+            continue
+        failures = 0
         sim.stats_at = timed.at if timed else None
         sim.step(snap, latest, hour, now)
         state.save(path)
@@ -598,15 +608,21 @@ def cmd_advise(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> No
     n = 0
     while True:
         now = int(time.time())
-        items = client.mapping()
-        latest = client.latest()
-        hour = client.hourly()
+        try:
+            items = client.mapping()
+            latest = client.latest()
+            hour = client.hourly()
+            stats = _stats(args, client, items, now)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"{time.strftime('%H:%M:%S')} fetch failed ({type(e).__name__}: {e}); retrying in {args.interval}s", flush=True)
+            time.sleep(args.interval)
+            continue
         used = _used(args, ledger, now)
         flips = find_flips(
             items, latest, hour, budget=parse_gp(args.budget), now=now,
             min_volume=args.min_volume, min_margin=args.min_margin, min_roi=args.min_roi / 100,
             max_age_s=args.max_age * 60, members=_members_filter(args), used=used,
-            stats=_stats(args, client, items, now),
+            stats=stats,
         )[: args.top]
         payload = {
             "ts": now,
