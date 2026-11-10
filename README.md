@@ -15,6 +15,8 @@ Five commands:
 | `bought` | Records what you've bought so remaining 4-hour buy limits are honoured by `flips` and `item`. |
 | `simulate` | Paper-trading agent: runs the ranking on a schedule, places simulated offers, fills them against real later prices. Live loop or 24h+ backtest. |
 | `sync` | Imports your real trades from RuneLite's Flipping Utilities: fills the buy-limit ledger, reports FIFO P&L and fill times, calibrates the simulator's fill model. |
+| `history` | Backfills / tops up the local market history: 5m windows (30 d), 1h windows (365 d) and daily series (1 y) for every item. |
+| `peaks` | When the market, or one item, actually trades: volume / spread / fill rate by hour of day and weekday. |
 
 No third-party dependencies; Python 3.10+.
 
@@ -144,48 +146,68 @@ The schema is taken from the plugin's source (Gson field names `b`, `id`, `cQIT`
 `t`, `st`, `tSFO` …). It was verified against a synthetic file, not a real export — if a
 real file fails to parse, open an issue with the file attached.
 
-## Local market history and how ranking works
+## Local market history
 
-Every command that ranks items keeps a local SQLite store of **5-minute windows for all
-items**, pulled from the wiki's bulk `/5m?timestamp=` endpoint (one request per window,
-all ~2,000 traded items at once). First run fetches the last 3 days (~860 requests, ~1
-min); afterwards each run tops up only the windows it is missing.
+Every ranking command keeps a local SQLite store (`~/.osrs-ge-analyser/history.db`,
+override `GE_ANALYSER_HISTORY`) filled from the wiki's bulk endpoints — one gzip request
+per window for **all** items, rate-limited to 6 req/s:
+
+| Table | Source | Default depth | Requests | Used for |
+|---|---|---|---|---|
+| 5m windows | `/5m?timestamp=` | 30 days | ~8,600 | fill rates, spreads, intraday timing |
+| 1h windows | `/1h?timestamp=` | 365 days | ~8,800 | hour-of-week volume, market `peaks` |
+| daily | `/timeseries?lookback=1y` per item | 1 year | ~3,700 | long-run trend |
+
+The API actually serves 5+ years at every resolution; these defaults are what the
+models need, not what's available. Raise them with `history --days-5m/--days-1h`.
 
 ```sh
-ge-analyser history --days 7     # backfill / inspect coverage
-ge-analyser --history-days 7 flips   # use a week of history for the stats
+ge-analyser history                  # full backfill once (~45 min), then incremental
+ge-analyser --history-days 7 flips   # stats window (default 14 days)
 ge-analyser --no-stats flips         # legacy scoring without history
 ```
 
-From that history, three per-item features are computed (cached for 30 min):
+## When does the market move? (`peaks`)
+
+```sh
+ge-analyser peaks                    # 24 x 7 heat table of market-wide volume (1h data, 90 days)
+ge-analyser peaks "mahogany logs"    # per hour of day: volume, spread, P(buy fills), P(sell fills)
+```
+
+Example: Mahogany logs trade ~3× more at 01–04 UTC than at 10 UTC, and the chance a
+bid at the instant-sell gets filled within 30 min swings between 60% and 87% by hour.
+That is the signal the ranking uses below.
+
+## How ranking works
+
+From the 5m history, per item, four features are computed overall **and for each of 12
+time-of-week buckets** (six 4-hour UTC blocks × weekday/weekend), cached for 6 hours:
 
 | Feature | Question it answers |
 |---|---|
-| `fill_buy`, `fill_sell` | In the last N days, how often did a bid at a window's instant-sell get **crossed** by a later window within 30 min (and likewise an ask at the instant-buy)? Same rule the simulator uses, so `Fill = fill_buy × fill_sell` is its round-trip fill probability. |
+| `fill_buy`, `fill_sell` | How often did a bid at a window's instant-sell get **crossed** by a later window within 30 min (and likewise an ask at the instant-buy)? Same rule the simulator uses, so `Fill = fill_buy × fill_sell` is its round-trip fill probability. |
 | `median_margin` (`Typ`) | The typical after-tax spread. Today's margin above it is treated as a spike and capped. |
 | `volatility_pct` (`Vol`) | Std-dev of 5m mid-price moves. A margin smaller than this is noise. |
+| `typical_volume` | Median one-sided units/hour. The liquidity planned on is `min(live hourly volume, typical for this time of week)`, so a Sunday-evening volume spike doesn't size Tuesday-morning offers. |
 
-Score with history: `Expect = min(margin, Typ) × Qty × Fill`, then
-`score = Expect × 1/(1 + age_h) × (0.5 + ln(1 + vol/h)/10) × 1/(1 + Vol% / ROI%)`.
-Items with fewer than 12 two-sided windows in the period get `Fill = 1%` (they are
-illiquid by definition) and sink. Without history (`--no-stats`) the legacy score is
-`profit × staleness × liquidity`.
+A bucket is used for an item only when it has ≥ 72 two-sided windows (6 hours of
+prints); otherwise the item's overall stats apply. Items with < 12 windows overall are
+illiquid by definition: `Fill = 1%` and they sink.
+
+Score: `Expect = min(margin, Typ) × Qty × Fill`, then
+`score = Expect × 1/(1 + age_h) × (0.5 + ln(1 + liquidity)/10) × 1/(1 + Vol% / ROI%)`.
+Without history (`--no-stats`) the legacy score is `profit × staleness × liquidity`.
 
 Does it help? Same strict fill model, same 10k start, all items, features computed only
-from windows *before* each replay (`simulate --backtest H --compare`):
+from windows *before* each replay (`simulate --backtest H --compare` runs three
+variants: time-of-week features, flat features, legacy):
 
-| Horizon | History features | Legacy | Win rate (hist / legacy) |
-|---|---|---|---|
-| 24h | +119% | +81% | 61% / 47% |
-| 48h | +533% | +696% | 62% / 51% |
-| 72h | +1,507% | +594% | 60% / 43% |
-| 96h | +1,874% | +506% | 68% / 60% |
-| 72h, F2P, 3 slots | +159% | +26% | 57% / 48% |
+| Replay | Time-of-week | Flat features | Legacy | Win rate (tow / flat / legacy) |
+|---|---|---|---|---|
+| 24h, 5 days of features | +128% | +109% | +100% | 62% / 65% / 38% |
 
-Four of five horizons favour the features and the win rate is higher in all of them.
-Absolute returns are backtest numbers on a tiny stack and compound; read the ratio, not
-the magnitude.
-
+Absolute returns are backtest numbers on a tiny stack and compound; read the ratios and
+win rates, not the magnitudes.
 
 ## Caching
 

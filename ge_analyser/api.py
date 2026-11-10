@@ -6,6 +6,7 @@ The wiki requires a descriptive User-Agent; anonymous clients get blocked.
 
 from __future__ import annotations
 
+import gzip
 import json
 import time
 import urllib.request
@@ -71,9 +72,14 @@ class GEClient:
         if ttl > 0 and cache_file.exists() and time.time() - cache_file.stat().st_mtime < ttl:
             return json.loads(cache_file.read_text(encoding="utf-8"))
 
-        req = urllib.request.Request(f"{BASE_URL}/{endpoint}", headers={"User-Agent": USER_AGENT})
+        req = urllib.request.Request(
+            f"{BASE_URL}/{endpoint}", headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"}
+        )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            body = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                body = gzip.decompress(body)
+            data = json.loads(body.decode("utf-8"))
 
         if ttl > 0:
             self.cache_dir.mkdir(parents=True, exist_ok=True)

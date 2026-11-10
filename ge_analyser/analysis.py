@@ -88,6 +88,7 @@ class ItemStats:
     fill_sell: float  # P(an ask at the window's instant-buy is crossed within 30 min)
     median_margin: int  # median after-tax spread per unit across windows
     volatility_pct: float  # std-dev of 5m mid-price % changes
+    typical_volume: int = 0  # median one-sided units per hour (0 = unknown)
 
     @property
     def p_fill(self) -> float:
@@ -96,7 +97,7 @@ class ItemStats:
 
 # Used when history is enabled but an item has too few two-sided 5m windows to measure:
 # such items are illiquid, so assume both legs rarely fill and trust today's margin.
-UNKNOWN_STATS = ItemStats(windows=0, fill_buy=0.1, fill_sell=0.1, median_margin=0, volatility_pct=0.0)
+UNKNOWN_STATS = ItemStats(windows=0, fill_buy=0.1, fill_sell=0.1, median_margin=0, volatility_pct=0.0, typical_volume=0)
 
 @dataclass(frozen=True)
 class Flip:
@@ -106,7 +107,8 @@ class Flip:
     tax: int
     margin: int  # per-unit profit after tax
     roi: float  # margin / buy
-    hourly_volume: int  # conservative: min(buys, sells) in last hour
+    hourly_volume: int  # conservative: min(buys, sells) in the last hour
+    liquidity: int  # units/h planned on: min(hourly_volume, typical for this time of week)
     limit_left: int  # remaining 4h buy limit (item.limit when nothing recorded; 0 = unknown)
     quantity: int  # units you can realistically flip given limit, budget, volume
     profit: int  # margin * quantity
@@ -151,14 +153,17 @@ def evaluate_flip(
     if margin <= 0:
         return None
     hourly_volume = min(hour.high_volume, hour.low_volume) if hour else 0
-    qty = flip_quantity(item, buy, hourly_volume, budget, used)
+    # Liquidity we plan on: never more than the market is doing right now, and never
+    # more than this item typically does at this time of week.
+    liq = min(hourly_volume, stats.typical_volume) if stats and stats.typical_volume > 0 else hourly_volume
+    qty = flip_quantity(item, buy, liq, budget, used)
     if qty == 0:
         return None
     profit = margin * qty
     roi = margin / buy
     age = now - min(latest.high_time, latest.low_time)
     staleness = 1.0 / (1.0 + age / 3600)
-    liquidity = math.log1p(hourly_volume)
+    liquidity = math.log1p(liq)
     if stats is None:
         # No history: profit per cycle, discounted by staleness, rewarding liquidity.
         expected = profit
@@ -179,6 +184,7 @@ def evaluate_flip(
         margin=margin,
         roi=roi,
         hourly_volume=hourly_volume,
+        liquidity=liq,
         limit_left=remaining_limit(item, used),
         quantity=qty,
         profit=profit,
@@ -215,7 +221,7 @@ def find_flips(
         flip = evaluate_flip(item, price, hour.get(item_id), budget, now, used.get(item_id, 0), item_stats)
         if flip is None:
             continue
-        if flip.hourly_volume < min_volume or flip.margin < min_margin:
+        if flip.liquidity < min_volume or flip.margin < min_margin:
             continue
         if flip.roi < min_roi or flip.price_age_s > max_age_s:
             continue

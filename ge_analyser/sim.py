@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .analysis import Flip, ItemStats, find_flips, ge_tax
 from .api import ItemInfo, LatestPrice, WindowPrice
@@ -138,7 +138,8 @@ class Simulator:
         self.state = state
         self.items = items
         self.cfg = config
-        self.stats: dict[int, ItemStats] | None = None  # per-item history features; None = legacy scoring
+        # Per-item history features for a given moment (time-of-week aware); None = legacy scoring.
+        self.stats_at: Callable[[int], dict[int, ItemStats]] | None = None
 
     # ---- helpers -------------------------------------------------------
     def _log(self, now: int, msg: str) -> None:
@@ -261,7 +262,7 @@ class Simulator:
             min_roi=self.cfg.min_roi,
             max_age_s=self.cfg.max_age,
             members=self.cfg.members,
-            stats=self.stats,
+            stats=self.stats_at(now) if self.stats_at else None,
             used=self.used_limits(now),
         )
         placed: list[Order] = []

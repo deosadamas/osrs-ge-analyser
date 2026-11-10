@@ -14,6 +14,8 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from typing import Callable
+from datetime import datetime, timezone
 
 from .analysis import (
     Flip,
@@ -27,8 +29,8 @@ from .analysis import (
 )
 from .api import GEClient, ItemInfo
 from .calibrate import calibrate, fifo_pnl, fill_stats, lookback_for_age
-from .features import cached_stats, compute_stats
-from .history import HistoryStore
+from .features import TimedStats, bucket_label, bucket_of, cached_timed_stats, compute_timed_stats, crossings
+from .history import DEFAULT_DEPTH_DAYS, STEPS, HistoryStore
 from .ledger import Ledger, Purchase
 from . import runelite
 from .sim import (
@@ -126,12 +128,17 @@ def _top_up(store: HistoryStore, client: GEClient, days: float) -> int:
     return store.update(client, days)
 
 
-def _stats(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], now: int) -> dict[int, ItemStats] | None:
+def _timed_stats(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], now: int) -> TimedStats | None:
     if args.no_stats:
         return None
     store = HistoryStore()
     _top_up(store, client, args.history_days)
-    return cached_stats(store, {i: it.name for i, it in items.items()}, args.history_days, now)
+    return cached_timed_stats(store, {i: it.name for i, it in items.items()}, args.history_days, now)
+
+
+def _stats(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], now: int) -> dict[int, ItemStats] | None:
+    timed = _timed_stats(args, client, items, now)
+    return timed.at(now) if timed else None
 
 
 def cmd_flips(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
@@ -229,12 +236,20 @@ def cmd_item(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
     if hour:
         print(f"  Last hour: {hour.high_volume:,} bought @ avg {fmt_gp(hour.avg_high or 0)}, {hour.low_volume:,} sold @ avg {fmt_gp(hour.avg_low or 0)}")
 
-    st = (_stats(args, client, items, now) or {}).get(item.id)
-    if st:
+    timed = _timed_stats(args, client, items, now)
+    if timed and item.id in timed.overall:
+        st = timed.overall[item.id]
         print(
             f"  History ({args.history_days:g}d, {st.windows} windows): fill P(buy) {st.fill_buy * 100:.0f}%  P(sell) {st.fill_sell * 100:.0f}%  "
-            f"typical margin {fmt_gp(st.median_margin)}  5m volatility {st.volatility_pct:.2f}%"
+            f"typical margin {fmt_gp(st.median_margin)}  5m volatility {st.volatility_pct:.2f}%  typical volume {st.typical_volume:,}/h"
         )
+        b = bucket_of(now)
+        bs = timed.buckets.get(b, {}).get(item.id)
+        if bs:
+            print(
+                f"  Now ({bucket_label(b)}, {bs.windows} windows): fill P(buy) {bs.fill_buy * 100:.0f}%  P(sell) {bs.fill_sell * 100:.0f}%  "
+                f"typical margin {fmt_gp(bs.median_margin)}  typical volume {bs.typical_volume:,}/h"
+            )
 
     for lookback, label in (("24h", "24h (5m candles)"), ("30d", "30 days (1h candles)"), ("6m", "6 months (6h candles)")):
         trend = trend_from_timeseries(client.timeseries(item.id, lookback))
@@ -361,7 +376,8 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
         now = int(time.time())
         latest, five, hour = client.latest(), client.window("5m"), client.hourly()
         snap = snapshot_from_live(latest, five)
-        sim.stats = _stats(args, client, items, now)
+        timed = _timed_stats(args, client, items, now)
+        sim.stats_at = timed.at if timed else None
         sim.step(snap, latest, hour, now)
         state.save(path)
         print(f"--- {time.strftime('%H:%M:%S', time.localtime(now))} ---")
@@ -379,11 +395,11 @@ def _run_backtest(
     budget: int,
     start: int,
     end: int,
-    stats: dict[int, ItemStats] | None,
+    stats_at: Callable[[int], dict[int, ItemStats]] | None,
 ) -> tuple[State, Snapshot, int]:
     state = State(start_cash=budget, cash=budget)
     sim = Simulator(state, items, cfg)
-    sim.stats = stats
+    sim.stats_at = stats_at
     history: list[Snapshot] = []
     snap: Snapshot = {}
     replayed = 0
@@ -410,17 +426,21 @@ def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemI
     start = end - int(args.backtest * 3600)
     names = {i: it.name for i, it in items.items()}
     # Features come only from windows *before* the replay starts: no look-ahead.
-    stats = None if args.no_stats else compute_stats(store, names, start - int(args.history_days * 86400), start)
+    timed = None if args.no_stats else compute_timed_stats(store, names, start - int(args.history_days * 86400), start)
     cfg.max_age = 10 * 60  # buckets are always fresh relative to their own timestamp
     span = f"{time.strftime('%m-%d %H:%M', time.localtime(start))} to {time.strftime('%m-%d %H:%M', time.localtime(end))}"
     print(f"Backtest: {args.backtest:g}h of 5m history ({span}), all items, start {fmt_gp(budget)}, {cfg.slots} slots")
-    if stats is not None:
-        print(f"Scoring with history features for {len(stats)} items ({args.history_days:g} days before the replay)")
+    if timed is not None:
+        bucketed = sum(len(d) for d in timed.buckets.values())
+        print(f"Scoring with history features for {len(timed.overall)} items, {bucketed} item-buckets by time of week ({args.history_days:g} days before the replay)")
 
     if args.compare:
+        variants = [("time-of-week features", timed.at if timed else None), ("flat features", timed.flat_at if timed else None), ("legacy (no history)", None)]
         rows = []
-        for label, st in (("history features", stats), ("legacy (no history)", None)):
-            state, snap, _ = _run_backtest(store, items, cfg, budget, start, end, st)
+        for label, provider in variants:
+            if timed is None and provider is None and label != "legacy (no history)":
+                continue
+            state, snap, _ = _run_backtest(store, items, cfg, budget, start, end, provider)
             eq = state.equity(snap)
             sells = [t for t in state.trades if t.kind == "sell"]
             rows.append([label, fmt_gp(eq), f"{eq - budget:+,}", f"{(eq - budget) / budget * 100:+.1f}%", str(len(sells)), str(sum(1 for t in sells if t.profit > 0))])
@@ -428,7 +448,7 @@ def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemI
         print(_table(["Scoring", "Equity", "P&L", "Return", "Sells", "Wins"], rows, right={1, 2, 3, 4, 5}))
         return
 
-    state, snap, replayed = _run_backtest(store, items, cfg, budget, start, end, stats)
+    state, snap, replayed = _run_backtest(store, items, cfg, budget, start, end, timed.at if timed else None)
     print(f"Replayed {replayed} buckets\n")
     _print_sim(state, snap, end, tail=25)
     sells = [t for t in state.trades if t.kind == "sell"]
@@ -443,13 +463,108 @@ def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemI
 
 def cmd_history(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
     store = HistoryStore()
-    fetched = _top_up(store, client, args.days)
-    first, last, n = store.coverage()
-    if first is None:
-        print("History is empty.")
+    t0 = time.time()
+
+    def progress(tag):
+        return lambda d, n: print(f"  {tag}: {d}/{n} ({time.time() - t0:.0f}s)", file=sys.stderr, flush=True) if d % 500 == 0 or d == n else None
+
+    for step, days in (("5m", args.days_5m), ("1h", args.days_1h)):
+        missing = len(store.missing(int(time.time()) - int(days * 86400), int(time.time()) - STEPS[step], step))
+        if missing:
+            print(f"Fetching {missing} {step} windows...", file=sys.stderr)
+        store.update(client, days, step=step, rate=args.rate, progress=progress(step))
+    if not args.no_daily:
+        ids = sorted(client.mapping())
+        store.update_daily(client, ids, rate=args.rate, progress=progress("daily"))
+    for step in ("5m", "1h"):
+        first, last, n = store.coverage(step)
+        if first is None:
+            print(f"{step}: empty")
+            continue
+        span = f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(first))} .. {time.strftime('%Y-%m-%d %H:%M', time.localtime(last))}"
+        print(f"{step}: {n:,} windows, {span}")
+    n, first = store.daily_coverage()
+    print(f"daily: {n:,} item-days" + (f" since {time.strftime('%Y-%m-%d', time.localtime(first))}" if first else ""))
+    print(f"Store: {store.path} ({store.path.stat().st_size / 1e6:.0f} MB)")
+
+
+DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _heat(values: dict[tuple[int, int], float]) -> str:
+    """24 x 7 table of values scaled to % of the max."""
+    top = max(values.values(), default=0) or 1
+    rows = []
+    for hour in range(24):
+        cells = [f"{values.get((hour, d), 0) / top * 100:3.0f}" for d in range(7)]
+        avg = sum(values.get((hour, d), 0) for d in range(7)) / 7 / top * 100
+        rows.append([f"{hour:02d}:00", *cells, f"{avg:3.0f}"])
+    return _table(["UTC", *DOW, "avg"], rows, right=set(range(1, 9)))
+
+
+def cmd_peaks(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
+    store = HistoryStore()
+    now = int(time.time())
+    local_off = (datetime.now() - datetime.utcnow()).total_seconds() / 3600
+    if not args.query:
+        days = args.days or 90
+        first, _, _ = store.coverage("1h")
+        if first is None:
+            sys.exit("No hourly history yet; run `ge-analyser history` first.")
+        since = now - int(days * 86400)
+        vol: dict[tuple[int, int], float] = {}
+        for ts, hvol, lvol in store.db.execute("SELECT ts, hvol, lvol FROM w1h WHERE ts >= ?", (since,)):
+            d = datetime.fromtimestamp(ts, timezone.utc)
+            key = (d.hour, d.weekday())
+            vol[key] = vol.get(key, 0) + min(hvol, lvol)
+        occ: dict[tuple[int, int], int] = {}
+        for (ts,) in store.db.execute("SELECT DISTINCT ts FROM w1h WHERE ts >= ?", (since,)):
+            d = datetime.fromtimestamp(ts, timezone.utc)
+            occ[(d.hour, d.weekday())] = occ.get((d.hour, d.weekday()), 0) + 1
+        mean = {k: v / occ.get(k, 1) for k, v in vol.items()}
+        print(f"Market-wide two-sided volume (min of buys/sells, summed over items), % of the busiest hour, last {days:g} days. Local time = UTC{local_off:+.0f}h.\n")
+        print(_heat(mean))
+        best = sorted(mean.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        worst = sorted(mean.items(), key=lambda kv: kv[1])[:5]
+        print("\nBusiest: " + ", ".join(f"{DOW[d]} {h:02d}:00" for (h, d), _ in best))
+        print("Quietest: " + ", ".join(f"{DOW[d]} {h:02d}:00" for (h, d), _ in worst))
         return
-    span = f"{time.strftime('%m-%d %H:%M', time.localtime(first))} .. {time.strftime('%m-%d %H:%M', time.localtime(last))}"
-    print(f"Fetched {fetched} new window(s). Store has {n:,} windows ({span}) at {store.path}")
+
+    items = client.mapping()
+    item = _find_item(items, args.query)
+    days = args.days or 30
+    rows = list(store.db.execute("SELECT ts, high, hvol, low, lvol FROM w5 WHERE item=? AND ts >= ? ORDER BY ts", (item.id, now - int(days * 86400))))
+    ws = crossings(rows)
+    if len(ws) < 48:
+        sys.exit(f"Only {len(ws)} two-sided 5m windows for {item.name} in {days:g} days; not enough to say anything.")
+    by_hour: dict[int, list] = {}
+    for w in ws:
+        by_hour.setdefault(datetime.fromtimestamp(w.ts, timezone.utc).hour, []).append(w)
+    print(f"{item.name}: by hour of day (UTC; local = UTC{local_off:+.0f}h), last {days:g} days, {len(ws)} two-sided windows\n")
+    out = []
+    for hour in range(24):
+        hws = by_hour.get(hour, [])
+        judged = [w for w in hws if w.judged]
+        if not hws:
+            out.append([f"{hour:02d}:00", "0", "-", "-", "-", "-"])
+            continue
+        margins = [w.high - ge_tax(w.high, item.name) - w.low for w in hws]
+        out.append(
+            [
+                f"{hour:02d}:00",
+                str(len(hws)),
+                f"{int(statistics.median(w.hourly_volume for w in hws)):,}",
+                fmt_gp(int(statistics.median(margins))),
+                f"{sum(w.buy_hit for w in judged) / len(judged) * 100:.0f}%" if judged else "-",
+                f"{sum(w.sell_hit for w in judged) / len(judged) * 100:.0f}%" if judged else "-",
+            ]
+        )
+    print(_table(["UTC", "Windows", "Vol/h", "Margin", "P(buy)", "P(sell)"], out, right={1, 2, 3, 4, 5}))
+    print("\nVol/h = median one-sided units per hour; Margin = median after-tax spread; P = chance a bid/ask at the instant price is crossed within 30 min.")
+    wk = [w for w in ws if datetime.fromtimestamp(w.ts, timezone.utc).weekday() >= 5]
+    wd = [w for w in ws if datetime.fromtimestamp(w.ts, timezone.utc).weekday() < 5]
+    if wk and wd:
+        print(f"Weekend vs weekday median Vol/h: {int(statistics.median(w.hourly_volume for w in wk)):,} vs {int(statistics.median(w.hourly_volume for w in wd)):,}")
 
 
 def _fmt_secs(s: float | None) -> str:
@@ -543,7 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-cache", action="store_true", help="bypass the local response cache")
     p.add_argument("--ignore-ledger", action="store_true", help="assume fresh buy limits, ignoring recorded purchases")
     p.add_argument("--no-stats", action="store_true", help="legacy scoring: ignore the local price history")
-    p.add_argument("--history-days", type=float, default=3, help="days of 5m history used for per-item fill/margin/volatility stats (default 3)")
+    p.add_argument("--history-days", type=float, default=14, help="days of 5m history used for per-item fill/margin/volatility stats and time-of-week buckets (default 14)")
     sub = p.add_subparsers(dest="command", required=True)
 
     def common(sp: argparse.ArgumentParser) -> None:
@@ -597,9 +712,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--reset", action="store_true", help="delete the live simulation state")
     s.set_defaults(func=cmd_simulate)
 
-    h = sub.add_parser("history", help="backfill / top up the local 5-minute market history (all items)")
-    h.add_argument("--days", type=float, default=7, help="how far back to ensure coverage (default 7)")
+    h = sub.add_parser("history", help="backfill / top up the local market history (5m, 1h and daily, all items)")
+    h.add_argument("--days-5m", type=float, default=DEFAULT_DEPTH_DAYS["5m"], help="5-minute windows to keep (default 30 days)")
+    h.add_argument("--days-1h", type=float, default=DEFAULT_DEPTH_DAYS["1h"], help="hourly windows to keep (default 365 days)")
+    h.add_argument("--no-daily", action="store_true", help="skip the 1-year daily series per item")
+    h.add_argument("--rate", type=float, default=6.0, help="max requests per second to the wiki (default 6)")
     h.set_defaults(func=cmd_history)
+
+    k = sub.add_parser("peaks", help="when does the market (or one item) trade: volume, spread and fill rate by hour of day and weekday")
+    k.add_argument("query", nargs="?", help="item name or id; omit for the whole market")
+    k.add_argument("--days", type=float, default=None, help="history window (default 90 for market from 1h data, 30 for an item from 5m data)")
+    k.set_defaults(func=cmd_peaks)
 
     y = sub.add_parser("sync", help="import real trades from RuneLite Flipping Utilities: buy limits, P&L, fill times, model calibration")
     y.add_argument("paths", nargs="*", help="account .json files or directories (default ~/.runelite/flipping)")
