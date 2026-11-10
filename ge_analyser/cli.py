@@ -844,7 +844,7 @@ def cmd_tune(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
     print()
     print(
         _table(
-            ["Candidate", "Older folds (mean)", "Rank", "Newest fold"],
+            ["Candidate", "Older folds (median)", "Rank", "Newest fold"],
             [[n, f"{tr * 100:+.1f}%", str(rk), f"{te * 100:+.1f}%"] for n, tr, te, rk in rows],
             right={1, 2, 3},
         )

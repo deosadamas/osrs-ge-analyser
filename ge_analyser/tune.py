@@ -87,13 +87,15 @@ def run(
 
 
 def summarise(results: list[FoldResult], candidates: list[Candidate]) -> tuple[list[tuple[str, float, float, float]], str]:
-    """Per candidate: mean return on older folds, rank there, return on the newest fold.
-    Returns rows sorted by older-fold mean, and the recommended candidate name."""
+    """Per candidate: median return on older folds, rank there, return on the newest fold.
+    Median, not mean: with compounding one runaway fold can be 20x the others and would
+    otherwise decide the ranking alone. Returns rows sorted by that median and the
+    recommended candidate name (only when it also beats the default on the newest fold)."""
     older = [r for r in results if r.fold > 0]
     newest = results[0] if results else None
     rows = []
     for c in candidates:
-        train = statistics.fmean(r.returns[c.name] for r in older) if older else float("nan")
+        train = statistics.median(r.returns[c.name] for r in older) if older else float("nan")
         test = newest.returns[c.name] if newest else float("nan")
         rows.append((c.name, train, test, 0.0))
     rows.sort(key=lambda r: r[1], reverse=True)
