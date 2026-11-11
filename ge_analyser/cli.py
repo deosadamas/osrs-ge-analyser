@@ -876,9 +876,13 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--margin-cap", type=float, default=MARGIN_CAP, help="plan asks at most this multiple of an item's typical margin over cost; 0 = off (default 2)")
     x.add_argument("--no-margin-cancel", action="store_true", help="keep a buy offer even when the market has moved so it would lose after tax")
     x.add_argument("--volume-frac", type=float, default=None, help="size each order to this share of hourly volume (default: buy timeout / fill share = 0.05)")
+    x.add_argument("--buy-timeout", type=_positive, default=30, metavar="MIN", help="abort a buy offer that has not filled anything for this many minutes; orders are sized to what it can fill in that time (default 30)")
+    x.add_argument("--sell-reprice", type=_positive, default=30, metavar="MIN", help="relist a sell offer at the market after this many minutes without a sale (default 30)")
+    x.add_argument("--sell-dump", type=_positive, default=90, metavar="MIN", help="sell at the instant-sell price once a lot has been on sale this many minutes (default 90)")
     x.add_argument("--backtest", type=float, metavar="HOURS", help="replay the last N hours through the same engine with a paper broker")
     x.add_argument("--compare", action="store_true", help="backtest: show how the result depends on the share of volume you get, the inventory limit and the old simulator")
     x.add_argument("--play", metavar="START-END", help="backtest: local hours you are at the GE each day, e.g. 19-23 (default: around the clock)")
+    x.add_argument("--look-every", type=int, default=5, metavar="MIN", help="backtest: you look at the GE and act once every MIN minutes; offers fill in between (default 5)")
     x.add_argument("--report", action="store_true", help="session so far: profit, orders, stock, real fills vs the model")
     x.set_defaults(func=cmd_execute)
 
@@ -970,6 +974,14 @@ def _exec_dir(args: argparse.Namespace) -> Path:
     return Path(override) if override else Path.home() / ".osrs-ge-analyser" / "exec"
 
 
+def _positive(text: str) -> float:
+    """argparse type: a number greater than zero."""
+    value = float(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return value
+
+
 def _exec_config(args: argparse.Namespace) -> ExecConfig:
     members = _members_filter(args)
     return ExecConfig(
@@ -982,6 +994,9 @@ def _exec_config(args: argparse.Namespace) -> ExecConfig:
         min_roi=args.min_roi / 100,
         improve=not args.no_improve,
         fill_share=args.fill_share,
+        buy_timeout=int(args.buy_timeout * 60),
+        sell_reprice=int(args.sell_reprice * 60),
+        sell_dump=int(args.sell_dump * 60),
         volume_frac=args.volume_frac,
         cancel_on_margin=not args.no_margin_cancel,
         margin_cap=args.margin_cap,
@@ -1129,10 +1144,16 @@ def _exec_report(d: Path) -> None:
         print(f"Real fills vs the paper model on {reality.orders} measured buy orders: {ratio} (1.00 = backtests are right; below = they overstate)")
 
 
-def _play_schedule(spec: str | None):
-    """--play START-END in local hours -> (predicate or None, description)."""
+def _play_schedule(spec: str | None, look_every: int = 5):
+    """--play START-END (local hours) and --look-every MIN -> (predicate or None, description)."""
+    if look_every < 5 or look_every % 5:
+        sys.exit("--look-every takes minutes in steps of 5: the history has one window per 5 minutes")
+    every = look_every // 5
+    looks = f", a look every {look_every} min" if every > 1 else ""
     if not spec:
-        return None, "at the GE around the clock"
+        if every == 1:
+            return None, "at the GE around the clock"
+        return (lambda ts: (ts // 300) % every == 0), f"around the clock{looks}"
     try:
         a, b = (int(x) for x in spec.split("-"))
         if not (0 <= a < 24 and 0 < b <= 24) or a == b:
@@ -1142,12 +1163,13 @@ def _play_schedule(spec: str | None):
 
     def active(ts: int) -> bool:
         h = time.localtime(ts).tm_hour
-        return a <= h < b if a < b else (h >= a or h < b)
+        return (a <= h < b if a < b else (h >= a or h < b)) and (ts // 300) % every == 0
 
-    return active, f"at the GE {a:02d}:00-{b % 24:02d}:00 local ({(b - a) % 24} h a day)"
+    return active, f"at the GE {a:02d}:00-{b % 24:02d}:00 local ({(b - a) % 24} h a day){looks}"
 
 
 def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
+    active, presence = _play_schedule(args.play, args.look_every)  # bad flags fail before the history is topped up
     items = client.mapping()
     cfg = _exec_config(args)
     cfg.max_age = 10 * 60  # history buckets are fresh relative to their own timestamp
@@ -1165,7 +1187,6 @@ def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
     windows = list(store.windows(start - 3600, end + 1))
     span = f"{time.strftime('%m-%d %H:%M', time.localtime(start))} to {time.strftime('%m-%d %H:%M', time.localtime(end))}"
     who = "free-to-play items" if cfg.members is False else "all items"
-    active, presence = _play_schedule(args.play)
     print(f"Execution backtest: {args.backtest:g}h ({span}), {who}, start {fmt_gp(budget)}, {cfg.slots} GE slots, {cfg.inventory_slots} inventory stacks, {presence}")
 
     def top_share(pnl: dict[str, int]) -> str:
@@ -1183,13 +1204,15 @@ def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
 
     def row(label: str, r) -> list[str]:
         st = r.state
+        offers = sum(r.broker.placed.values())  # placed or aborted: what you have to do by hand
         return [
             label, fmt_gp(r.equity), f"{r.ret * 100:+.0f}%", fmt_gp(r.profit_per_hour), str(st.sells), f"{st.wins / st.sells * 100:.0f}%" if st.sells else "-",
-            f"{r.actions_per_hour:.0f}", str(r.broker.max_stacks), top_share(r.pnl_by_item),
+            f"{offers / r.span_hours * 24:,.0f}" if r.span_hours else "-", f"{(r.equity - r.start_cash) / offers:,.0f}" if offers else "-",
+            str(r.broker.max_stacks), top_share(r.pnl_by_item),
         ]
 
-    headers = ["Model", "Equity", "Return", "gp/h at GE", "Sells", "Win", "Clicks/h", "Max stacks", "Biggest winner"]
-    right = {1, 2, 3, 4, 5, 6, 7}
+    headers = ["Model", "Equity", "Return", "gp/h at GE", "Sells", "Win", "Offers/day", "gp/offer", "Max stacks", "Biggest winner"]
+    right = {1, 2, 3, 4, 5, 6, 7, 8}
     if args.compare:
         rows = []
         for share in (10, 30, 100):
@@ -1206,7 +1229,7 @@ def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
             eq = state.equity(snap)
             rows.append([
                 "old simulator, 1/10 (sells need no slot)", fmt_gp(eq), f"{(eq / budget - 1) * 100:+.0f}%", fmt_gp((eq - budget) / args.backtest), str(len(sells)),
-                f"{sum(t.profit > 0 for t in sells) / len(sells) * 100:.0f}%" if sells else "-", "-", "-", top_share(by),
+                f"{sum(t.profit > 0 for t in sells) / len(sells) * 100:.0f}%" if sells else "-", "-", "-", "-", top_share(by),
             ])
         print()
         print(_table(headers, rows, right=right))

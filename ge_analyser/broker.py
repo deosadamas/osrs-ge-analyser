@@ -238,11 +238,6 @@ class BacktestResult:
         return self.equity / self.start_cash - 1
 
     @property
-    def actions_per_hour(self) -> float:
-        """Offers placed or aborted per hour at the GE."""
-        return sum(self.broker.placed.values()) / self.hours if self.hours else 0.0
-
-    @property
     def profit_per_hour(self) -> float:
         """gp gained per hour at the GE."""
         return (self.equity - self.start_cash) / self.hours if self.hours else 0.0

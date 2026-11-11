@@ -194,13 +194,14 @@ collected it, so its final count cannot be missed — `collected: true`.
   report it. An instruction that is not in your status yet is repeated unchanged — same
   order id, same price — for 3 minutes, then re-planned at current prices. If you place
   a withdrawn instruction after all and report it, it is taken back on the book.
-- **Buys**: bid 1 gp over the instant-sell. Cancelled after 30 min without a fill, or as
-  soon as the market has moved so the bid would lose money after tax. A cancel frees the
-  slot and the coins for a replacement in the same batch.
+- **Buys**: bid 1 gp over the instant-sell. Cancelled after 30 min without a fill
+  (`--buy-timeout`), or as soon as the market has moved so the bid would lose money
+  after tax. A cancel frees the slot and the coins for a replacement in the same batch.
 - **Sells**: listed 1 gp under the instant-buy as soon as the buy finishes (or once a
   still-filling buy has delivered 20% of its value). After 30 min without a sale it is
-  relisted at the market, after 90 min at the instant-sell price — a loss is taken and
-  reported as one rather than left to sit. One buy and one sell offer per item at a time.
+  relisted at the market (`--sell-reprice`), after 90 min at the instant-sell price
+  (`--sell-dump`) — a loss is taken and reported as one rather than left to sit. One
+  buy and one sell offer per item at a time.
 - **An order missing from your status** is not guessed at: for 2 minutes the answer
   holds its slot and asks you to report it (`"needs_status": true`); after that it is
   assumed cancelled at the last count you gave, with a warning.
@@ -219,6 +220,52 @@ collected it, so its final count cannot be missed — `collected: true`.
   free-to-play accounts (under 20 hours played, 10 quest points or total level 100 some
   items cannot be sold on the GE). Live prices are single last trades; backtests see
   5-minute averages.
+
+### Fewer offers for the same money
+
+The defaults suit someone sitting at the GE: a buy that has not filled in 30 minutes is
+replaced, and stock that has not sold is relisted after 30. That is about 800 offers to
+place or abort per day. If each offer costs you effort, give them more time:
+
+```sh
+ge-analyser execute --buy-timeout 120 --sell-reprice 120 --sell-dump 240
+```
+
+Orders become about four times bigger (they are sized to what the buy timeout can
+fill) and are left alone for two hours. One week (Nov 3–10), 8 slots, N = 30; "offers"
+are offers placed or aborted:
+
+| Start 1m | Profit | Offers a day | gp per offer |
+|---|---|---|---|
+| default, acting every 5 min | +1.03m | 790 | 186 |
+| patient, acting every 5 min | +1.23m | 368 | 477 |
+| patient, a look every 30 min | +1.05m | 192 | 781 |
+| patient, a look every 60 min | +860k | 132 | 932 |
+
+| Start 10k | Profit | Offers a day | gp per offer |
+|---|---|---|---|
+| default, acting every 5 min | +539k | 803 | 96 |
+| patient, acting every 5 min | +419k | 334 | 179 |
+| patient, a look every 30 min | +232k | 195 | 170 |
+| patient, a look every 60 min | +162k | 143 | 163 |
+
+With 1m the patient settings earn the same or more at every N tried (105–132% of the
+default at N = 10, 30 and 100) for less than half the offers; a look every 30 minutes
+costs nothing (95–103%), every hour 2–22%. A 10k stack grows by turning over quickly,
+so there patience costs 18–34%, and looking only every 30 minutes more than half.
+In between (N = 30) the patient settings draw level with the default at about 100k
+(76% of its profit at 50k, 98% at 100k, 106% at 300k), and a look every 30 minutes
+costs 40% at 100k, 16% at 300k and nothing at 1m.
+
+This is one week of history under the paper fill model. Bigger orders held longer
+also carry more price risk than a single week shows. To try other settings on your
+own stack:
+
+```sh
+ge-analyser execute --backtest 168 --budget 1m --fill-share 30 --buy-timeout 120 --sell-reprice 120 --sell-dump 240 --look-every 30
+```
+
+The table it prints has `Offers/day` and `gp/offer` columns.
 
 ### What re-evaluating the model found
 
@@ -259,11 +306,14 @@ off by a coin in any run below). What it showed:
    item really trades, so from about 1m up a bigger stack earns the same gp: 100m makes
    exactly what 10m makes. Admitting thinner, pricier items (`--min-volume 10`) did not
    help in a 24-hour test. This is a strategy for cheap, liquid items.
-5. **It is a lot of clicking for the gp.** About 34 offers placed or aborted per hour
-   with 8 slots (14 with 3). Around the clock that is 1k–14k gp per hour at the GE
-   depending on N and stack. Four hours a day (`--play 19-23`, N = 30) keeps 26–40% of
-   the weekly profit for a 1m+ stack because offers fill while you are away (+271k from
-   1m, 9.7k gp/h at the GE); a 10k stack loses its compounding (+51k instead of +539k).
+5. **It is a lot of clicking for the gp.** With the default settings, about 34 offers
+   placed or aborted per hour with 8 slots (14 with 3): 30–450 gp per offer, or 1k–14k
+   gp per hour at the GE, depending on N and stack. Giving offers more time halves the
+   offers, and from a 1m stack that costs nothing even if you then look only every 30
+   minutes — see "Fewer offers for the same money" above. Four hours a day
+   (`--play 19-23`, N = 30) keeps 26–40% of the weekly profit for a 1m+ stack because
+   offers fill while you are away (+271k from 1m, 9.7k gp/h at the GE); a 10k stack
+   loses its compounding (+51k instead of +539k).
 6. **Real mechanics cost 12–26% against the old simulator** on the same data and N
    (+1.50m vs +1.71m from 10k, +2.24m vs +3.01m from 1m; nothing with 3 free-to-play
    slots). The 26-stack limit never binds: at most 8 stacks were ever held.
