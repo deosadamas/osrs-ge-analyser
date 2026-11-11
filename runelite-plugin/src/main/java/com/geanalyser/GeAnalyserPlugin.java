@@ -47,15 +47,15 @@ import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.util.ImageUtil;
 
 /**
- * Shows the flips suggested by the osrs-ge-analyser CLI next to the game, records your
- * real GE offers for its `sync` command and keeps status.json up to date for its
- * `execute` loop. It only reads the game and writes files: it never places, changes or
- * cancels an offer.
+ * Next to the game: shows what the osrs-ge-analyser CLI's `execute` loop says to do (or
+ * the flips its `advise` suggests), records your real GE offers for its `sync` command
+ * and keeps status.json up to date for `execute`. It only reads the game, reads and
+ * writes files and draws a panel: it never places, changes or cancels an offer.
  */
 @Slf4j
 @PluginDescriptor(
 	name = "GE Analyser",
-	description = "Flip suggestions from osrs-ge-analyser, a trade log for sync and a live status file for execute",
+	description = "Instructions and flip suggestions from osrs-ge-analyser, a trade log for sync and a live status file for execute",
 	tags = {"grand", "exchange", "flipping", "merch"}
 )
 public class GeAnalyserPlugin extends Plugin
@@ -94,6 +94,8 @@ public class GeAnalyserPlugin extends Plugin
 	private ScheduledFuture<?> refresh;
 	private TradeRecorder recorder;
 	private long lastAdviceMtime = -1;
+	private long adviceCheckedAt;
+	private long lastOrdersMtime = -1;
 
 	private StatusWriter statusWriter;
 	private Path restoredFrom;
@@ -133,7 +135,10 @@ public class GeAnalyserPlugin extends Plugin
 		// Enabled while already logged in: the offers are settled, there is no login to wait for.
 		loggingIn = client.getGameState() != GameState.LOGGED_IN;
 		settledAtTick = loggingIn ? Integer.MAX_VALUE : client.getTickCount();
-		refresh = executor.scheduleWithFixedDelay(this::reloadAdvice, 0, config.refreshSeconds(), TimeUnit.SECONDS);
+		lastAdviceMtime = -1;
+		adviceCheckedAt = 0;
+		lastOrdersMtime = -1;
+		refresh = executor.scheduleWithFixedDelay(this::refreshPanel, 0, 1, TimeUnit.SECONDS);
 	}
 
 	@Override
@@ -167,7 +172,70 @@ public class GeAnalyserPlugin extends Plugin
 		return (dir == null || dir.trim().isEmpty() ? DATA_DIR.resolve("exec") : Paths.get(dir.trim())).resolve("status.json");
 	}
 
-	private void reloadAdvice()
+	/** Once a second, off the client thread: hands the panel whatever the CLI wrote since the last look. */
+	private void refreshPanel()
+	{
+		GeAnalyserPanel p = panel;
+		if (p == null)
+		{
+			return;
+		}
+		try
+		{
+			long now = Instant.now().getEpochSecond();
+			reloadOrders(p);
+			if (now - adviceCheckedAt >= config.refreshSeconds())
+			{
+				adviceCheckedAt = now;
+				reloadAdvice(p);
+			}
+			SwingUtilities.invokeLater(() -> p.refresh(now));
+		}
+		catch (RuntimeException e)
+		{
+			log.warn("could not refresh the panel", e); // thrown on, it would end the schedule
+		}
+	}
+
+	/** orders.json is the answer of `ge-analyser execute`; it lies next to the status file it answers. */
+	private void reloadOrders(GeAnalyserPanel p)
+	{
+		Path file = statusFile().resolveSibling("orders.json");
+		try
+		{
+			if (!Files.exists(file))
+			{
+				if (lastOrdersMtime != -2)
+				{
+					lastOrdersMtime = -2;
+					SwingUtilities.invokeLater(() -> p.setOrders(null));
+				}
+				return;
+			}
+			long mtime = Files.getLastModifiedTime(file).toMillis();
+			if (mtime == lastOrdersMtime)
+			{
+				return;
+			}
+			lastOrdersMtime = mtime;
+			Orders orders = gson.fromJson(new String(Files.readAllBytes(file), StandardCharsets.UTF_8), Orders.class);
+			log.debug("{}: {} actions", file, orders == null ? "no" : orders.getActions().size());
+			SwingUtilities.invokeLater(() -> p.setOrders(orders));
+		}
+		catch (IOException e)
+		{
+			log.debug("could not read {}", file, e);
+			lastOrdersMtime = -1; // the CLI may be replacing it this instant: look again next second
+		}
+		catch (RuntimeException e)
+		{
+			log.warn("could not read {}", file, e);
+			Orders problem = Orders.unreadable("Could not read " + file + ": " + e.getMessage(), Instant.now().getEpochSecond());
+			SwingUtilities.invokeLater(() -> p.setOrders(problem));
+		}
+	}
+
+	private void reloadAdvice(GeAnalyserPanel p)
 	{
 		Path file = adviceFile();
 		try
@@ -177,7 +245,7 @@ public class GeAnalyserPlugin extends Plugin
 				if (lastAdviceMtime != -2)
 				{
 					lastAdviceMtime = -2;
-					SwingUtilities.invokeLater(() -> panel.showMessage("No advice file at " + file + ".  Run `ge-analyser advise`."));
+					SwingUtilities.invokeLater(() -> p.setNoAdvice(null));
 				}
 				return;
 			}
@@ -190,12 +258,12 @@ public class GeAnalyserPlugin extends Plugin
 			String json = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
 			Advice advice = gson.fromJson(json, Advice.class);
 			int max = config.maxRows();
-			SwingUtilities.invokeLater(() -> panel.show(advice, max));
+			SwingUtilities.invokeLater(() -> p.setAdvice(advice, max));
 		}
 		catch (IOException | RuntimeException e)
 		{
 			log.warn("could not read {}", file, e);
-			SwingUtilities.invokeLater(() -> panel.showMessage("Could not read " + file + ": " + e.getMessage()));
+			SwingUtilities.invokeLater(() -> p.setNoAdvice("Could not read " + file + ": " + e.getMessage()));
 		}
 	}
 

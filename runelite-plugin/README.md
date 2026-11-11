@@ -2,7 +2,8 @@
 
 Three things next to the game:
 
-- a side panel with the flips suggested by the `ge-analyser` CLI;
+- a side panel: what `ge-analyser execute` says to do right now, or the flips
+  `ge-analyser advise` suggests;
 - a recorder that logs your real GE offers for `ge-analyser sync`;
 - a **live status file** for `ge-analyser execute`: your GE offers, coins and inventory,
   rewritten whenever one of them changes, so the execution loop needs no typing.
@@ -66,6 +67,36 @@ order ids, also across client restarts, and stayed right with a player who colle
 late. It has not yet been watched through a real logged-in session.
 
 ## The panel
+
+### Instructions, while `ge-analyser execute` is running
+
+The panel shows the loop's answer (`orders.json`, in the folder of the status file)
+within a second of it being written, so the terminal can stay out of sight. Do the rows
+top to bottom:
+
+| Row | What to do |
+|---|---|
+| `COLLECT` item | Collect that offer: it finished or was aborted. |
+| `CANCEL` item | Abort that offer and collect what it holds. |
+| `SELL` item, `qty × price gp each` | Place that sell offer. "take the items out of its buy offer first": the units are still in a buy offer, which keeps running. |
+| `BUY` item, `qty × price gp each` | Place that buy offer. |
+| `HOLD` item, in grey | Nothing: an offer or a stack to leave alone. |
+
+Quantities and prices are written out in full, as the GE shows them. Under each row is
+the engine's reason, and warnings are in yellow above the rows. The header has your
+coins, what you should hold once the batch is placed, equity and realised profit, GE
+slots and inventory stacks in use, and the age of the answer. That turns red, with "no
+new answer", when the loop has not answered for three minutes: it was stopped, or it
+cannot fetch prices. Suggestions from `advise`, if there are any, then take its place.
+
+The panel only displays. You place, abort and collect every offer yourself.
+
+How it was checked: the panel was drawn, outside the client, from the answers the CLI
+wrote for a scripted session (every kind of row, a stale answer, no status yet); and a
+real client, by its log, read each new answer within a second of it being written. Like
+the status file, it has not yet been watched through a logged-in session.
+
+### Suggestions, from `ge-analyser advise`
 
 Each row: item, `buy X → sell Y  +margin/ea`, then `qty · limit left/limit · fill % · exp`.
 Items whose 4-hour buy limit you have exhausted are shown in red. The header shows the

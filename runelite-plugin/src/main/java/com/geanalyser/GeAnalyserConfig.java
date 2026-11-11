@@ -68,7 +68,7 @@ public interface GeAnalyserConfig extends Config
 	@ConfigItem(
 		keyName = "statusFile",
 		name = "Status file",
-		description = "Where to write it. Empty = ~/.osrs-ge-analyser/exec/status.json (or the folder in GE_ANALYSER_EXEC)",
+		description = "Where to write it. Empty = ~/.osrs-ge-analyser/exec/status.json (or the folder in GE_ANALYSER_EXEC). The instructions shown in the panel are the orders.json in the same folder",
 		position = 5
 	)
 	default String statusFile()

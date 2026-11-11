@@ -70,6 +70,7 @@ tasks.register('shadowJar', Jar) {
     exclude 'META-INF/*.RSA'
     exclude '**/module-info.class'
     exclude 'com/geanalyser/StatusWriterTest*'
+    exclude 'com/geanalyser/OrdersTest*'
 
     group = BasePlugin.BUILD_GROUP
     archiveFileName.set("${rootProject.name}-${project.version}-all.jar")

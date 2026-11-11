@@ -163,7 +163,10 @@ changes (and once a minute otherwise). It reads; it never clicks.
 ge-analyser execute        # leave it running next to RuneLite; no --init needed
 ```
 
-Then the whole job is: do what the terminal says, top to bottom.
+Then the whole job is: do what it says, top to bottom. The plugin's side panel shows the
+same list next to the game (what to collect, abort, sell and buy, then the offers to
+leave alone), redrawn within a second or two of every change, so the terminal can stay
+out of sight.
 
 - **Coins are exact.** `cash` is what is in your inventory (platinum tokens count as
   1,000 each), read every time, so nothing has to be corrected. Coins still sitting in
@@ -397,14 +400,16 @@ State lives in `~/.osrs-ge-analyser/sim.json` (override with `GE_ANALYSER_SIM`).
 
 ## In-game panel (RuneLite plugin)
 
-`runelite-plugin/` is a small sideloadable RuneLite plugin: a side panel listing the
-current suggestions (item, buy→sell, margin, qty, remaining limit, fill probability) fed
-by `ge-analyser advise`, plus a recorder that logs your real GE offers for `sync`. It
-reads game state and draws; it never places offers. See `runelite-plugin/README.md`.
+`runelite-plugin/` is a small RuneLite plugin. Its side panel shows the execution loop's
+instructions while `ge-analyser execute` is answering, and otherwise the current
+suggestions (item, buy→sell, margin, qty, remaining limit, fill probability) from
+`ge-analyser advise`. It also keeps the loop's `status.json` and logs your real GE
+offers for `sync`. It reads game state and draws; it never places offers. See
+`runelite-plugin/README.md`.
 
 ```sh
 ge-analyser advise --budget 10m --top 15      # refreshes ~/.osrs-ge-analyser/advice.json every 60 s
-cd runelite-plugin && ./gradlew jar           # build/libs/ge-analyser-0.1.0.jar
+cd runelite-plugin && ./gradlew run           # RuneLite with the plugin built in
 ```
 
 ## Syncing real trades from RuneLite

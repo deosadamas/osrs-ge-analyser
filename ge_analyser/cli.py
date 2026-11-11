@@ -691,10 +691,7 @@ def cmd_advise(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> No
             print(f"{time.strftime('%H:%M:%S')} fetch failed ({type(e).__name__}: {e}); retrying in {args.interval}s", flush=True)
             time.sleep(args.interval)
             continue
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(out)
+        _write_json(out, payload, indent=None)
         n += 1
         print(f"{time.strftime('%H:%M:%S')} wrote {len(flips)} flips to {out}", flush=True)
         if args.ticks and n >= args.ticks:
@@ -1012,10 +1009,21 @@ def _read_json(path: Path):
 
 
 def _write_json(path: Path, obj, indent: int | None = 2) -> None:
+    """Write a file that others read (you, the RuneLite plugin): complete, and in one step."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, indent=indent), encoding="utf-8")
-    tmp.replace(path)
+    # Windows refuses the swap for as long as anything has `path` open, and the plugin looks
+    # at these files every second. That takes it a moment, so a refusal is tried again.
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def _print_plan(out: dict) -> None:

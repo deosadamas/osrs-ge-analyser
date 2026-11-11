@@ -1,0 +1,273 @@
+{
+  "time": "2026-11-11 09:20:44",
+  "seq": 3,
+  "ts": 1794406844,
+  "status_age_s": 420,
+  "account": {
+    "cash": 8858,
+    "cash_after_actions": 1715,
+    "cash_correction": 0,
+    "in_buy_offers": 5210,
+    "stock_value": 3506,
+    "equity_est": 17574,
+    "realised": 900,
+    "tax_paid": 0,
+    "sells": 1,
+    "wins": 1,
+    "ge_slots_used": 8,
+    "ge_slots": 8,
+    "inventory_stacks": 6,
+    "inventory_capacity": 26,
+    "items_allowed": "all"
+  },
+  "actions": [
+    {
+      "step": 1,
+      "action": "COLLECT",
+      "order_id": 8,
+      "item": "Iron dart",
+      "item_id": 807,
+      "side": "sell",
+      "qty": 450,
+      "price": 7,
+      "filled": 450,
+      "why": "executed: 450/450 sold; collect to free the slot"
+    },
+    {
+      "step": 2,
+      "action": "COLLECT",
+      "item": "Death rune",
+      "item_id": 560,
+      "side": "sell",
+      "slot": 6,
+      "why": "a finished offer this engine did not place: collect it to free the slot"
+    },
+    {
+      "step": 3,
+      "action": "CANCEL",
+      "order_id": 3,
+      "item": "Watermelon seed",
+      "item_id": 5321,
+      "side": "buy",
+      "qty": 58,
+      "price": 50,
+      "filled": 0,
+      "why": "no fill for 30m (0/58); free the slot and the coins"
+    },
+    {
+      "step": 4,
+      "action": "SELL",
+      "order_id": 10,
+      "item": "Adamant dart",
+      "item_id": 810,
+      "side": "sell",
+      "qty": 81,
+      "price": 25,
+      "cost_each": 22.0,
+      "profit_each": 3.0,
+      "collect_first": [
+        4
+      ],
+      "why": "list bought stock: cost 22.0, +3.0/ea after tax"
+    },
+    {
+      "step": 5,
+      "action": "BUY",
+      "order_id": 11,
+      "item": "Iron dart",
+      "item_id": 807,
+      "side": "buy",
+      "qty": 450,
+      "price": 5,
+      "then_sell_at": 7,
+      "profit_each": 2,
+      "why": "+2/ea selling at 7 (40.0%), fill chance ?, 9,000 traded/h"
+    },
+    {
+      "step": 6,
+      "action": "BUY",
+      "order_id": 12,
+      "item": "Blighted manta ray",
+      "item_id": 24589,
+      "side": "buy",
+      "qty": 48,
+      "price": 82,
+      "then_sell_at": 93,
+      "profit_each": 10,
+      "why": "+10/ea selling at 93 (12.2%), fill chance ?, 9,000 traded/h"
+    },
+    {
+      "step": 7,
+      "action": "BUY",
+      "order_id": 13,
+      "item": "Moonlight antler bolts",
+      "item_id": 28878,
+      "side": "buy",
+      "qty": 29,
+      "price": 133,
+      "then_sell_at": 148,
+      "profit_each": 13,
+      "why": "+13/ea selling at 148 (9.8%), fill chance ?, 9,000 traded/h"
+    },
+    {
+      "step": 8,
+      "action": "HOLD",
+      "item": "Abyssal whip",
+      "item_id": 4151,
+      "side": "buy",
+      "why": "not placed by this engine: left alone (it uses a GE slot)"
+    },
+    {
+      "step": 9,
+      "action": "HOLD",
+      "order_id": 2,
+      "item": "Supercompost",
+      "item_id": 6034,
+      "side": "buy",
+      "qty": 150,
+      "price": 20,
+      "filled": 95,
+      "why": "buying 95/150, last fill 0m ago"
+    },
+    {
+      "step": 10,
+      "action": "HOLD",
+      "order_id": 4,
+      "item": "Adamant dart",
+      "item_id": 810,
+      "side": "buy",
+      "qty": 136,
+      "price": 22,
+      "filled": 81,
+      "why": "buying 81/136, last fill 0m ago"
+    },
+    {
+      "step": 11,
+      "action": "HOLD",
+      "order_id": 9,
+      "item": "Supercompost",
+      "item_id": 6034,
+      "side": "sell",
+      "qty": 90,
+      "price": 25,
+      "filled": 0,
+      "why": "selling 0/90, open 0m"
+    },
+    {
+      "step": 12,
+      "action": "HOLD",
+      "item": "Supercompost",
+      "item_id": 6034,
+      "side": "inventory",
+      "qty": 5,
+      "why": "5 more wait until sell order #9 finishes"
+    }
+  ],
+  "warnings": [
+    "status.json is 7 min old: update it before acting on these orders"
+  ],
+  "fills_booked": [
+    {
+      "ts": 1794406844,
+      "order_id": 8,
+      "side": "sell",
+      "item_id": 807,
+      "name": "Iron dart",
+      "qty": 450,
+      "price": 7,
+      "tax": 0,
+      "profit": 900
+    },
+    {
+      "ts": 1794406844,
+      "order_id": 2,
+      "side": "buy",
+      "item_id": 6034,
+      "name": "Supercompost",
+      "qty": 5,
+      "price": 20,
+      "tax": 0,
+      "profit": 0
+    },
+    {
+      "ts": 1794406844,
+      "order_id": 4,
+      "side": "buy",
+      "item_id": 810,
+      "name": "Adamant dart",
+      "qty": 81,
+      "price": 22,
+      "tax": 0,
+      "profit": 0
+    }
+  ],
+  "reply_template": {
+    "members": true,
+    "slots": 8,
+    "inventory_capacity": 26,
+    "orders": [
+      {
+        "order_id": 2,
+        "item": "Supercompost",
+        "side": "buy",
+        "status": "filling",
+        "filled": 95
+      },
+      {
+        "order_id": 3,
+        "item": "Watermelon seed",
+        "side": "buy",
+        "status": "cancelled",
+        "filled": 0
+      },
+      {
+        "order_id": 4,
+        "item": "Adamant dart",
+        "side": "buy",
+        "status": "filling",
+        "filled": 81
+      },
+      {
+        "order_id": 9,
+        "item": "Supercompost",
+        "side": "sell",
+        "status": "open",
+        "filled": 0
+      },
+      {
+        "order_id": 10,
+        "item": "Adamant dart",
+        "side": "sell",
+        "status": "open",
+        "filled": 0
+      },
+      {
+        "order_id": 11,
+        "item": "Iron dart",
+        "side": "buy",
+        "status": "open",
+        "filled": 0
+      },
+      {
+        "order_id": 12,
+        "item": "Blighted manta ray",
+        "side": "buy",
+        "status": "open",
+        "filled": 0
+      },
+      {
+        "order_id": 13,
+        "item": "Moonlight antler bolts",
+        "side": "buy",
+        "status": "open",
+        "filled": 0
+      }
+    ]
+  },
+  "calibration": {
+    "finished_buy_orders_measured": 0,
+    "real_fill_vs_model": null,
+    "order_size_scale": 1.0
+  },
+  "how_to_reply": "Press Collect at the GE, do the actions top to bottom, then rewrite status.json: for every order still in the GE (or just finished) its order_id, status (open | filling | executed | cancelled) and filled. reply_template is that file pre-filled; edit status and filled. Coins are counted for you from what you report: add \"cash\": <your coins> only when account.cash is not what you hold."
+}
