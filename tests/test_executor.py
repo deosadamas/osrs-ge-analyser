@@ -2,7 +2,7 @@ import pytest
 
 from ge_analyser.analysis import ItemStats, ask_for_margin, capped_ask, ge_tax
 from ge_analyser.api import ItemInfo, LatestPrice, WindowPrice
-from ge_analyser.executor import ExecConfig, ExecOrder, ExecState, Executor, Market, StatusError, parse_status
+from ge_analyser.executor import ExecConfig, ExecOrder, ExecState, Executor, Market, StatusError, easy_quantity, parse_status
 
 ORE, SALMON, WHIP, DEATH = 440, 329, 4151, 560
 ITEMS = {
@@ -22,7 +22,8 @@ def market(prices, now, stats=None, vol=10_000):
 
 
 def engine(**cfg):
-    return Executor(ExecState(), ITEMS, ExecConfig(**cfg))
+    # Exact order sizes unless a test asks for rounding: what is checked here is the book, not the arithmetic.
+    return Executor(ExecState(), ITEMS, ExecConfig(**{"round_quantities": False, **cfg}))
 
 
 def status(cash, orders=(), now=T0, **extra):
@@ -210,6 +211,22 @@ def test_buy_timeout_cancels_and_reuses_the_coins_in_the_same_batch():
     assert all(o.id != first["order_id"] for o in eng.state.orders) and not eng.state.positions
 
 
+def test_a_big_stack_gives_an_unfilled_buy_more_time():
+    def first_abort(cash, **cfg):
+        eng = engine(buy_timeout=1800, buy_timeout_big=3600, **cfg)
+        (buy,) = acts(eng.step(status(cash, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+        report = [{"order_id": buy["order_id"], "status": "open"}]
+        eng.step(status(None, report, T0 + 60, slots=1), market(ORE_ONLY, T0 + 60), T0 + 60)
+        for minutes in range(5, 125, 5):
+            t = T0 + 60 + minutes * 60
+            if acts(eng.step(status(None, report, t, slots=1), market(ORE_ONLY, t), t), "CANCEL"):
+                return minutes
+
+    assert first_abort(10_000, big_stack=100_000) == 30
+    assert first_abort(100_000, big_stack=100_000) == 60  # equity counts the coins locked in the offer too
+    assert first_abort(100_000, big_stack=0) == 30  # 0: the same timeout whatever you have
+
+
 @pytest.mark.parametrize("cancel_on_margin", [True, False])
 def test_buy_is_cancelled_when_the_margin_is_gone(cancel_on_margin):
     eng = engine(cancel_on_margin=cancel_on_margin)
@@ -364,8 +381,9 @@ def test_small_change_is_not_spread_over_dust_orders():
     plan = eng.step(status(600, book), market(BOTH, T0), T0)
     assert [a["action"] for a in plan.actions] == ["HOLD"]
     # An order the market keeps small is not dust: a 100m stack still trades what the volume allows.
-    buys = acts(engine().step(status(100_000_000), market(BOTH, T0), T0), "BUY")
-    assert [(b["item"], b["qty"]) for b in buys] == [("Iron ore", 500), ("Salmon", 500)]  # 5% of 10,000 traded/h, ~0.05% of the stack each
+    buys = acts(engine(order_hours=0.5, fill_share=10).step(status(100_000_000), market(BOTH, T0), T0), "BUY")
+    # Half an hour of a tenth of the 10,000 traded an hour: 500 each, ~0.05% of the stack.
+    assert [(b["item"], b["qty"]) for b in buys] == [("Iron ore", 500), ("Salmon", 500)]
 
 
 def test_no_buy_without_a_chance_of_filling():
@@ -444,6 +462,25 @@ def test_a_whole_flip_from_plugin_statuses_without_order_ids():
     assert [a["action"] for a in plan.actions] == ["BUY"] and plan.account["cash"] == 10_634
 
 
+def test_a_sell_of_everything_you_hold_is_marked_all():
+    eng = engine()
+    eng.step(live(10_000), market(ORE_ONLY, T0), T0)  # asks for 99 @ 101
+    done = rl(0, "0-a", "BOUGHT", 101, 99, filled=99, since=T0 + 30)
+    t = T0 + 60
+    (sell,) = acts(eng.step(live(1, [done], t), market(ORE_ONLY, t), t), "SELL")
+    assert "all" not in sell  # still in the offer: none of it is in your inventory yet
+    t += 60
+    kept = {**done, "collected": True}
+    (sell,) = acts(eng.step(live(1, [kept], t, [{"item_id": ORE, "qty": 99}]), market(ORE_ONLY, t), t), "SELL")
+    assert sell["all"] is True and sell["qty"] == 99  # the GE's All button is the whole quantity
+    t += 60
+    (sell,) = acts(eng.step(live(1, [kept], t, [{"item_id": ORE, "qty": 150}]), market(ORE_ONLY, t), t), "SELL")
+    assert "all" not in sell and sell["qty"] == 99  # 51 of your own on top: this one has to be entered
+    t += 60
+    (sell,) = acts(eng.step(status(None, [], t), market(ORE_ONLY, t), t), "SELL")
+    assert "all" not in sell  # no inventory in the status: nothing is claimed about it
+
+
 def test_a_finished_offer_left_in_its_slot_never_becomes_a_new_instructions_fill():
     for since in (0, T0 - 100):  # nobody saw it placed / it was placed before the instruction
         eng = engine()
@@ -460,6 +497,22 @@ def test_a_finished_offer_left_in_its_slot_never_becomes_a_new_instructions_fill
         t += 60
         eng.step(live(10_000 - 50 * 101, [rl(0, "0-new", "BUYING", 101, 50, since=t - 20)], t, slots=2), market(ORE_ONLY, t), t)
         assert eng.state.orders[0].state == "working" and eng.state.orders[0].ref == "0-new"
+
+
+def test_an_offer_placed_with_one_unit_more_is_followed_as_it_was_placed():
+    # The GE's + buttons can leave you one over a round number: 401 for 400.
+    eng = engine()
+    (buy,) = acts(eng.step(live(1_000_000), market(ORE_ONLY, T0), T0), "BUY")
+    q, t = buy["qty"] + 1, T0 + 60
+    placed = rl(0, "0-a", "BUYING", 101, q, since=T0 + 30)
+    plan = eng.step(live(1_000_000 - 101 * q, [placed], t), market(ORE_ONLY, t), t)
+    (o,) = eng.state.orders
+    assert (o.id, o.state, o.qty, o.ref) == (buy["order_id"], "working", q, "0-a")
+    assert [(a["action"], a["qty"]) for a in plan.actions] == [("HOLD", q)]
+    t += 60
+    done = {**placed, "status": "BOUGHT", "filled": q, "spent": 101 * q, "collected": True}
+    (sell,) = acts(eng.step(live(1_000_000 - 101 * q, [done], t, [{"item_id": ORE, "qty": q}]), market(ORE_ONLY, t), t), "SELL")
+    assert (sell["qty"], sell["all"]) == (q, True) and eng.state.positions[ORE].qty == q
 
 
 def test_offers_you_placed_yourself_are_left_alone_and_their_items_avoided():
@@ -525,6 +578,33 @@ def test_missing_order_is_settled_from_the_inventory_when_reported():
 
 
 # ---- outlier guards ------------------------------------------------------------------
+
+
+def test_quantities_are_rounded_to_one_or_two_digits_that_are_not_zero():
+    plenty = 10**9
+    # One digit where that is within 15% of the size wanted...
+    assert [easy_quantity(q, plenty) for q in (7, 43, 62, 95, 387, 2_659, 22_600)] == [7, 40, 60, 100, 400, 3_000, 20_000]
+    # ...two where it is not: 140 is neither 100 nor 200.
+    assert [easy_quantity(q, plenty) for q in (14, 140, 150, 250, 1_499, 13_744)] == [14, 140, 150, 250, 1_500, 14_000]
+    # Never more than your coins or the buy limit allow.
+    assert [easy_quantity(q, most) for q, most in ((387, 399), (950, 950), (199, 199), (28, 28))] == [390, 900, 190, 28]
+    assert easy_quantity(1, plenty) == 1 and easy_quantity(0, plenty) == 0
+
+
+def test_rounded_buys_stay_within_your_coins_and_the_buy_limit():
+    def buys(cash, m, slots, **cfg):
+        eng = engine(order_hours=0.5, fill_share=10, **cfg)  # half an hour of a tenth of the volume: 5% of an hour's
+        return [(b["item"], b["qty"]) for b in acts(eng.step(status(cash, slots=slots), m, T0), "BUY")]
+
+    thin = market(ORE_ONLY, T0, vol=7_400)  # 5% of 7,400 units is 370
+    assert buys(1_000_000, thin, 1, round_quantities=False) == [("Iron ore", 370)]
+    assert buys(1_000_000, thin, 1, round_quantities=True) == [("Iron ore", 400)]  # coins to spare: up to the nearer round number
+    assert buys(7_000, market(BOTH, T0), 2, round_quantities=False) == [("Salmon", 70), ("Iron ore", 33)]
+    assert buys(7_000, market(BOTH, T0), 2, round_quantities=True) == [("Salmon", 70), ("Iron ore", 30)]  # 40 would cost more than is left
+    whips = market({WHIP: (1000, 1100)}, T0)
+    whips.used = {WHIP: 2}  # 68 of the 70 you may buy in four hours are left
+    assert buys(1_000_000, whips, 1, round_quantities=False) == [("Abyssal whip", 68)]
+    assert buys(1_000_000, whips, 1, round_quantities=True) == [("Abyssal whip", 60)]
 
 
 def test_ask_for_margin_and_cap():

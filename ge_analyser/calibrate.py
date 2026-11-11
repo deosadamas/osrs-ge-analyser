@@ -206,7 +206,10 @@ class FillReality:
     per_item: dict[int, tuple[float, int]]  # item -> (ratio, orders)
 
 
-def fill_reality(orders: Iterable[Any], side: str | None = None, cap: float = 2.0) -> FillReality:
+FILL_RATIO_CAP = 2.0  # real fills are never read as more than this many times the model's
+
+
+def fill_reality(orders: Iterable[Any], side: str | None = None, cap: float = FILL_RATIO_CAP) -> FillReality:
     """orders: closed execution orders carrying `filled`, `price`, `model_fill`. Orders
     the model gives nothing but that did fill count as `cap` (the model was too strict)."""
     num = den = 0.0

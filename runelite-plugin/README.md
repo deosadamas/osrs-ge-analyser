@@ -78,7 +78,7 @@ top to bottom:
 |---|---|
 | `COLLECT` item | Collect that offer: it finished or was aborted. |
 | `CANCEL` item | Abort that offer and collect what it holds. |
-| `SELL` item, `qty × price gp each` | Place that sell offer. "take the items out of its buy offer first": the units are still in a buy offer, which keeps running. |
+| `SELL` item, `qty × price gp each` | Place that sell offer. `all qty`: it is every unit of the item in your inventory, so there is no quantity to enter. "take the items out of its buy offer first": the units are still in a buy offer, which keeps running. |
 | `BUY` item, `qty × price gp each` | Place that buy offer. |
 | `HOLD` item, in grey | Nothing: an offer or a stack to leave alone. |
 

@@ -34,7 +34,7 @@ from .analysis import (
 )
 from .api import GEClient, ItemInfo
 from .broker import run_backtest
-from .calibrate import FillReality, calibrate, fifo_pnl, fill_reality, fill_stats, lookback_for_age, model_fill, sizing_scales
+from .calibrate import FILL_RATIO_CAP, FillReality, calibrate, fifo_pnl, fill_reality, fill_stats, lookback_for_age, model_fill, sizing_scales
 from .executor import ExecConfig, ExecState, Executor, Market, StatusError, parse_status
 from .features import TimedStats, bucket_label, bucket_of, cached_timed_stats, compute_timed_stats, crossings
 from .history import DEFAULT_DEPTH_DAYS, STEPS, HistoryStore
@@ -779,6 +779,10 @@ def cmd_sync(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
         print(f"  -> {c.suggestion()}")
 
 
+# The engine's own rule, spelled out for --help: a longer timeout once the stack is big enough.
+_BUY_TIMEOUT_DEFAULT = f"{ExecConfig.buy_timeout // 60}" + (
+    f", and {ExecConfig.buy_timeout_big // 60} once your coins, offers and stock are worth {ExecConfig.big_stack:,}" if ExecConfig.big_stack else ""
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -833,12 +837,12 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--include-shifts", action="store_true", help="also show items whose price has structurally re-levelled in the last week")
     d.set_defaults(func=cmd_dips)
 
-    def agent_args(sp: argparse.ArgumentParser) -> None:
+    def agent_args(sp: argparse.ArgumentParser, fill_share: int = 10) -> None:
         sp.add_argument("--budget", default="10k", help="starting cash (default 10k)")
         sp.add_argument("--slots", type=int, default=None, help="GE slots (default 8, or 3 with --f2p)")
         sp.add_argument("--min-volume", type=int, default=50, help="min two-sided units traded per hour")
         sp.add_argument("--max-age", type=int, default=60, help="ignore prices older than N minutes (live mode)")
-        sp.add_argument("--fill-share", type=int, default=10, help="assume we capture 1/N of each window's volume (higher = more conservative)")
+        sp.add_argument("--fill-share", type=int, default=fill_share, help=f"assume we capture 1/N of each window's volume; higher = more conservative (default {fill_share})")
         sp.add_argument("--loose", action="store_true", help="fill when the market touches our price instead of crossing it (optimistic)")
         sp.add_argument("--min-margin", type=int, default=2, help="min per-unit profit after tax to enter a flip")
         sp.add_argument("--min-roi", type=float, default=2.0, help="min ROI percent to enter a flip")
@@ -860,7 +864,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_simulate)
 
     x = sub.add_parser("execute", help="execution loop: reads your order status from status.json, writes what to do next (BUY / SELL / HOLD / CANCEL / COLLECT) to orders.json")
-    agent_args(x)
+    agent_args(x, fill_share=ExecConfig.fill_share)  # the share it assumes until your own fills say otherwise
     x.set_defaults(min_volume=200)
     x.add_argument("--dir", help="folder with status.json / orders.json / state.json (default ~/.osrs-ge-analyser/exec)")
     x.add_argument("--init", action="store_true", help="start a session: write a first status.json")
@@ -871,16 +875,19 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--inventory-slots", type=int, default=26, help="item stacks you can hold; collect as notes so each item is one stack (default 26; a value in status.json wins)")
     x.add_argument("--max-status-age", type=int, default=300, help="warn when status.json is older than this many seconds (default 300)")
     x.add_argument("--margin-cap", type=float, default=MARGIN_CAP, help="plan asks at most this multiple of an item's typical margin over cost; 0 = off (default 2)")
-    x.add_argument("--no-margin-cancel", action="store_true", help="keep a buy offer even when the market has moved so it would lose after tax")
-    x.add_argument("--volume-frac", type=float, default=None, help="size each order to this share of hourly volume (default: buy timeout / fill share = 0.05)")
-    x.add_argument("--buy-timeout", type=_positive, default=30, metavar="MIN", help="abort a buy offer that has not filled anything for this many minutes; orders are sized to what it can fill in that time (default 30)")
-    x.add_argument("--sell-reprice", type=_positive, default=30, metavar="MIN", help="relist a sell offer at the market after this many minutes without a sale (default 30)")
-    x.add_argument("--sell-dump", type=_positive, default=90, metavar="MIN", help="sell at the instant-sell price once a lot has been on sale this many minutes (default 90)")
+    x.add_argument("--margin-cancel", action=argparse.BooleanOptionalAction, default=ExecConfig.cancel_on_margin, help=f"abort a buy offer as soon as the market has moved so that it would lose after tax (default {'on' if ExecConfig.cancel_on_margin else 'off'})")
+    x.add_argument("--order-hours", type=_positive, default=ExecConfig.order_hours, metavar="H", help=f"size each buy to what this many hours of your share of the item's volume can fill (default {ExecConfig.order_hours:g})")
+    x.add_argument("--volume-frac", type=float, default=None, help="...or size each buy to this share of the item's hourly volume outright")
+    x.add_argument("--round-quantities", action=argparse.BooleanOptionalAction, default=ExecConfig.round_quantities, help=f"round buy quantities to one or two digits that are not zero (400, 3,000, 250): quick to enter, easy to hear (default {'on' if ExecConfig.round_quantities else 'off'})")
+    x.add_argument("--buy-timeout", type=_positive, default=None, metavar="MIN", help="abort a buy offer that has not filled anything for this many minutes, whatever you have (default: " + _BUY_TIMEOUT_DEFAULT + ")")
+    x.add_argument("--sell-reprice", type=_positive, default=ExecConfig.sell_reprice / 60, metavar="MIN", help=f"relist a sell offer at the market after this many minutes without a sale (default {ExecConfig.sell_reprice // 60})")
+    x.add_argument("--sell-dump", type=_positive, default=ExecConfig.sell_dump / 60, metavar="MIN", help=f"sell at the instant-sell price once a lot has been on sale this many minutes (default {ExecConfig.sell_dump // 60})")
     x.add_argument("--backtest", type=float, metavar="HOURS", help="replay the last N hours through the same engine with a paper broker")
     x.add_argument("--compare", action="store_true", help="backtest: show how the result depends on the share of volume you get, the inventory limit and the old simulator")
     x.add_argument("--play", metavar="START-END", help="backtest: local hours you are at the GE each day, e.g. 19-23 (default: around the clock)")
     x.add_argument("--look-every", type=int, default=5, metavar="MIN", help="backtest: you look at the GE and act once every MIN minutes; offers fill in between (default 5)")
     x.add_argument("--report", action="store_true", help="session so far: profit, orders, stock, real fills vs the model")
+    x.add_argument("--speak", nargs="?", const=str(SPEAK_DEFAULT), metavar="FILE", help="also write the next thing to do, as one line (epoch-ms TAB sentence), to FILE whenever it changes, for a program that reads such a file aloud. FILE defaults to the one the OSRS Access Panel speaks: ~/.runelite/skillassist-alerts.log")
     x.set_defaults(func=cmd_execute)
 
     h = sub.add_parser("history", help="backfill / top up the local market history (5m, 1h and daily, all items)")
@@ -981,7 +988,7 @@ def _positive(text: str) -> float:
 
 def _exec_config(args: argparse.Namespace) -> ExecConfig:
     members = _members_filter(args)
-    return ExecConfig(
+    cfg = ExecConfig(
         slots=args.slots if args.slots is not None else (3 if members is False else 8),
         inventory_slots=args.inventory_slots,
         min_volume=args.min_volume,
@@ -991,13 +998,17 @@ def _exec_config(args: argparse.Namespace) -> ExecConfig:
         min_roi=args.min_roi / 100,
         improve=not args.no_improve,
         fill_share=args.fill_share,
-        buy_timeout=int(args.buy_timeout * 60),
         sell_reprice=int(args.sell_reprice * 60),
         sell_dump=int(args.sell_dump * 60),
+        order_hours=args.order_hours,
         volume_frac=args.volume_frac,
-        cancel_on_margin=not args.no_margin_cancel,
+        cancel_on_margin=args.margin_cancel,
+        round_quantities=args.round_quantities,
         margin_cap=args.margin_cap,
     )
+    if args.buy_timeout is not None:  # said outright: that timeout, whatever the stack
+        cfg.buy_timeout, cfg.big_stack = int(args.buy_timeout * 60), 0
+    return cfg
 
 
 def _read_json(path: Path):
@@ -1042,7 +1053,7 @@ def _print_plan(out: dict) -> None:
             x["action"],
             f"#{x['order_id']}" if x.get("order_id") else "",
             str(x.get("item", "")),
-            f"{x['qty']:,}" if x.get("qty") is not None else "",
+            ("all " if x.get("all") else "") + f"{x['qty']:,}" if x.get("qty") is not None else "",
             f"{x['price']:,}" if x.get("price") is not None else "",
             x.get("why", ""),
         ])
@@ -1053,6 +1064,84 @@ def _print_plan(out: dict) -> None:
     for w in out["warnings"]:
         print(f"  ! {w}")
     sys.stdout.flush()
+
+
+def _print_answer(out: dict) -> None:
+    if "error" in out:
+        print(f"--- {out['time'][11:]}  {out['error']}", flush=True)
+    else:
+        _print_plan(out)
+
+
+def _todo_signature(out: dict) -> tuple:
+    """What an answer asks of you, without the parts that move on their own (fill counts,
+    minutes waited). While it stays the same there is nothing new to read."""
+    if "error" in out:
+        return ("error", out["error"])
+    rows = tuple(
+        (a["action"], a.get("order_id"), a.get("item_id"), a.get("side"), a.get("price"), None if a["action"] == "HOLD" else a.get("qty"), bool(a.get("needs_status")))
+        for a in out["actions"]
+    )
+    return rows, tuple(w for w in out["warnings"] if not w.startswith("status.json is "))
+
+
+# ---- the next thing to do, as a sentence for a program that reads it aloud -----
+
+SPEAK_DEFAULT = Path.home() / ".runelite" / "skillassist-alerts.log"  # the file the OSRS Access Panel speaks
+
+
+def _sentence(a: dict) -> str:
+    kind, item = a["action"], a.get("item") or "an item"
+    if kind == "COLLECT":
+        n = a.get("filled")
+        return f"Collect {item}: {n:,} {'bought' if a.get('side') == 'buy' else 'sold'}." if n else f"Collect {item}."
+    if kind == "CANCEL":
+        return f"Abort the {a['side']} offer for {item}."
+    if kind == "SELL":
+        first = "Take the items out of the buy offer, then sell" if a.get("collect_first") else "Sell"
+        return f"{first} {'all ' if a.get('all') else ''}{a['qty']:,} {item} at {a['price']:,} each."
+    return f"Buy {a['qty']:,} {item} at {a['price']:,} each."
+
+
+class Announcer:
+    """Picks what is worth saying aloud: that there is something to do, the next thing once
+    you have done one, and anything more urgent that turns up. An instruction that is only
+    re-planned while it waits for you is not read out again."""
+
+    def __init__(self) -> None:
+        self.keys: list[tuple] = []  # the things to do in the last answer, top first
+
+    @staticmethod
+    def _key(a: dict) -> tuple:
+        return (a["action"], a["order_id"]) if a.get("order_id") else (a["action"], a.get("item_id"), a.get("slot"))
+
+    def line(self, out: dict, withdrawn: set[int]) -> str | None:
+        """The sentence for this answer, if it calls for one. `withdrawn`: the ids of
+        instructions the engine took back unplaced, as opposed to ones you carried out."""
+        if "error" in out:
+            return None
+        todo = [a for a in out["actions"] if a["action"] != "HOLD"]
+        keys = [self._key(a) for a in todo]
+        before, self.keys = self.keys, keys
+        done = any(k not in keys and not (len(k) == 2 and k[1] in withdrawn) for k in before)
+        if not todo:
+            return "Grand Exchange: nothing left to do." if done else None
+        top = todo[0]
+        if not before:
+            return f"Grand Exchange: {len(todo)} thing{'s' if len(todo) > 1 else ''} to do. {_sentence(top)}"
+        if done or (keys[0] != before[0] and top["action"] in ("COLLECT", "CANCEL")):
+            return _sentence(top)
+        return None
+
+
+def _speak(path: Path, text: str) -> None:
+    """One line, `epoch-ms TAB text`, for whatever reads the file aloud. Never worth stopping the loop for."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"{int(time.time() * 1000)}\t{text}\n")
+    except OSError as e:
+        print(f"  ! could not write {path}: {e}", flush=True)
 
 
 def _exec_calibration(args: argparse.Namespace, state: ExecState, cfg: ExecConfig) -> FillReality | None:
@@ -1073,14 +1162,17 @@ def _exec_calibration(args: argparse.Namespace, state: ExecState, cfg: ExecConfi
     return fill_reality(state.done, side="buy")
 
 
-def _exec_cycle(args: argparse.Namespace, client: GEClient, ledger: Ledger, engine: Executor, items: dict[int, ItemInfo], d: Path) -> None:
+def _exec_cycle(args: argparse.Namespace, client: GEClient, ledger: Ledger, engine: Executor, items: dict[int, ItemInfo], d: Path) -> dict | None:
+    """Answer the current status: orders.json is written and returned. None when market
+    data could not be fetched; the last answer then stays as it was."""
     now = int(time.time())
     status_path, orders_path, state_path = d / "status.json", d / "orders.json", d / "state.json"
     stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
 
-    def fail(message: str) -> None:
-        _write_json(orders_path, {"time": stamp, "ts": now, "error": message, "actions": []})
-        print(f"--- {stamp[11:]}  {message}", flush=True)
+    def fail(message: str) -> dict:
+        out = {"time": stamp, "ts": now, "error": message, "actions": []}
+        _write_json(orders_path, out)
+        return out
 
     if not status_path.exists():
         return fail(f"no {status_path} yet: log in with the RuneLite plugin running, or run `ge-analyser execute --init --cash <coins>`")
@@ -1093,7 +1185,7 @@ def _exec_cycle(args: argparse.Namespace, client: GEClient, ledger: Ledger, engi
         timed = _timed_stats(args, client, items, now)
     except (OSError, ValueError, KeyError) as e:
         print(f"--- {stamp[11:]}  market data fetch failed ({type(e).__name__}: {e}); orders.json left as it was", flush=True)
-        return
+        return None
     reality = _exec_calibration(args, engine.state, engine.cfg)
     default_scale, item_scales = sizing_scales(reality) if reality else (1.0, {})
     market = Market(latest=latest, hour=hour, stats=timed.at(now) if timed else None, used=ledger.used(now), volume_scale=item_scales, default_scale=default_scale)
@@ -1111,15 +1203,26 @@ def _exec_cycle(args: argparse.Namespace, client: GEClient, ledger: Ledger, engi
         out["warnings"].insert(0, f"status.json is {out['status_age_s'] // 60} min old: update it before acting on these orders")
     out["calibration"] = {
         "finished_buy_orders_measured": reality.orders if reality else 0,
+        "share_assumed": f"1/{engine.cfg.fill_share}",
         "real_fill_vs_model": round(reality.ratio, 2) if reality and reality.ratio is not None else None,
+        "share_measured": f"1/{engine.cfg.fill_share / reality.ratio:.0f}" if reality and reality.ratio else None,
         "order_size_scale": round(default_scale, 2),
     }
     out["how_to_reply"] = HOW_TO_REPLY
     _write_json(orders_path, out)
-    _print_plan(out)
+    return out
 
 
-def _exec_report(d: Path) -> None:
+def _share_measured(reality: FillReality, fill_share: int) -> str:
+    """What your finished buy orders say about the share of volume you get, next to the one assumed."""
+    if reality.ratio is None:
+        return f"nothing to compare yet (the model assumes 1/{fill_share} of the volume crossing your price)"
+    n = fill_share / reality.ratio
+    more = " or more" if reality.ratio >= FILL_RATIO_CAP else ""
+    return f"{reality.ratio:.2f} x the 1/{fill_share} it assumes: you get about 1/{n:.0f}{more} of the volume crossing your price (the N in the backtest tables)"
+
+
+def _exec_report(d: Path, fill_share: int) -> None:
     state_path = d / "state.json"
     if not state_path.exists():
         sys.exit(f"No session in {d}. Start one with `ge-analyser execute --init --cash <coins>`.")
@@ -1148,8 +1251,7 @@ def _exec_report(d: Path) -> None:
         print(f"\nBuy orders finished: {len(buys)} - {full} filled completely, {some} partly, {len(buys) - full - some} not at all")
     reality = fill_reality(st.done, side="buy")
     if reality.orders:
-        ratio = f"{reality.ratio:.2f}" if reality.ratio is not None else "n/a"
-        print(f"Real fills vs the paper model on {reality.orders} measured buy orders: {ratio} (1.00 = backtests are right; below = they overstate)")
+        print(f"Real fills vs the paper model on {reality.orders} measured buy orders: {_share_measured(reality, fill_share)}")
 
 
 def _play_schedule(spec: str | None, look_every: int = 5):
@@ -1225,7 +1327,9 @@ def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
         rows = []
         for share in (10, 30, 100):
             rows.append(row(f"engine, you get 1/{share} of crossing volume", run(replace(cfg, fill_share=share), share)))
-        rows.append(row("engine, 1/10, unlimited inventory", run(replace(cfg, inventory_slots=10**6), 10)))
+        if cfg.fill_share != 100:  # the dangerous way to be wrong: orders sized for a share you do not get
+            rows.append(row(f"engine, you get 1/100 while it assumes 1/{cfg.fill_share}", run(cfg, 100)))
+        rows.append(row("engine, 1/10, unlimited inventory", run(replace(cfg, inventory_slots=10**6, fill_share=10), 10)))
         if active is None:
             legacy = Config(slots=cfg.slots, min_volume=cfg.min_volume, max_age=cfg.max_age, members=cfg.members, strict=not args.loose, min_margin=cfg.min_margin, min_roi=cfg.min_roi, improve=cfg.improve)
             state, snap, _ = replay(windows, items, legacy, budget, start, stats_at)
@@ -1266,7 +1370,7 @@ def cmd_execute(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> N
     d = _exec_dir(args)
     status_path, orders_path, state_path = d / "status.json", d / "orders.json", d / "state.json"
     if args.report:
-        _exec_report(d)
+        _exec_report(d, args.fill_share)
         return
     if args.init:
         if state_path.exists() and not args.reset:
@@ -1288,15 +1392,26 @@ def cmd_execute(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> N
 
     items = client.mapping()
     engine = Executor(ExecState.load(state_path) if state_path.exists() else ExecState(), items, _exec_config(args))
+    speak = Path(args.speak).expanduser() if args.speak else None
     if not args.once:
-        print(f"Execution loop: reading {status_path}, writing {orders_path}; answers every {args.interval}s and whenever status.json changes. Ctrl-C stops it.", flush=True)
-    seen = None
-    last_run = 0.0
+        aloud = f" The next thing to do is also written to {speak} to be read aloud." if speak else ""
+        print(f"Execution loop: reading {status_path}, writing {orders_path}; answers whenever status.json changes, on screen when what you have to do changes and every {args.interval}s.{aloud} Ctrl-C stops it.", flush=True)
+    announcer = Announcer() if speak else None
+    seen = shown = None
+    last_run = last_print = 0.0
     while True:
         sig = status_path.stat().st_mtime_ns if status_path.exists() else None
         if sig != seen or time.time() - last_run >= args.interval:
             seen, last_run = sig, time.time()
-            _exec_cycle(args, client, ledger, engine, items, d)
+            out = _exec_cycle(args, client, ledger, engine, items, d)
+            if out is not None:
+                todo = _todo_signature(out)
+                if args.once or todo != shown or time.time() - last_print >= args.interval:
+                    shown, last_print = todo, time.time()
+                    _print_answer(out)
+                line = announcer.line(out, {o.id for o in engine.state.done if o.outcome == "withdrawn"}) if announcer else None
+                if line:
+                    _speak(speak, line)
             if args.once:
                 return
         time.sleep(2)

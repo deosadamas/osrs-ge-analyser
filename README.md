@@ -72,7 +72,8 @@ coins, keeps the books, and measures its own model against what really filled.
 
 ```sh
 ge-analyser execute --init --cash 250k   # writes ~/.osrs-ge-analyser/exec/status.json
-ge-analyser execute                      # leave it running: answers every 60 s and the moment status.json changes
+ge-analyser execute                      # leave it running: it answers the moment status.json changes
+ge-analyser execute --speak              # ...and has the next thing to do read aloud (see below)
 ge-analyser execute --once               # ...or answer the current status once and exit
 ge-analyser execute --report             # profit so far, the book, stock held, real fills vs the model
 ```
@@ -88,7 +89,7 @@ Do the actions top to bottom.
 |---|---|
 | `COLLECT` | This order finished or was aborted. Collect it; its slot is free. |
 | `CANCEL` | Abort this offer and collect what it holds. |
-| `SELL` | Place a sell offer: `item`, `qty`, `price`. `collect_first` lists buy offers whose items to take out first. If you hold fewer than `qty`, sell what you hold. |
+| `SELL` | Place a sell offer: `item`, `qty`, `price`. `collect_first` lists buy offers whose items to take out first. `all: true` means `qty` is every unit of the item you hold. If you hold fewer than `qty`, sell what you hold. |
 | `BUY` | Place a buy offer: `item`, `qty`, `price`. `then_sell_at` is the planned ask. |
 | `HOLD` | Leave this offer, or this stack in your inventory, alone. |
 
@@ -110,7 +111,7 @@ Do the actions top to bottom.
   "warnings": [],
   "reply_template": {"members": true, "slots": 8, "inventory_capacity": 26,
                      "orders": [{"order_id": 3, "item": "Adamant dart", "side": "buy", "status": "open", "filled": 0}]},
-  "calibration": {"finished_buy_orders_measured": 0, "real_fill_vs_model": null, "order_size_scale": 1.0}
+  "calibration": {"finished_buy_orders_measured": 0, "share_assumed": "1/30", "real_fill_vs_model": null, "share_measured": null, "order_size_scale": 1.0}
 }
 ```
 
@@ -191,20 +192,50 @@ Extra fields the plugin writes: `source: "runelite"`, `account`, and per offer `
 `ref`, `since`, `spent` and — for a finished offer kept listed for 10 minutes after you
 collected it, so its final count cannot be missed — `collected: true`.
 
+### Where the instructions appear
+
+- **Terminal.** The list is printed when what you have to do changes, and once a
+  minute. A fill that changes nothing for you does not scroll it.
+- **RuneLite side panel.** The same list next to the game, with the plugin.
+- **Read aloud**, with `--speak`: the next thing to do, one sentence at a time, as a
+  line `epoch-ms<TAB>sentence` appended to a file that a screen-reading tool tails.
+  The default file is `~/.runelite/skillassist-alerts.log`, which the OSRS Access
+  Panel already speaks; `--speak FILE` writes elsewhere. A sentence is written when
+  - there is something to do after there was nothing: *Grand Exchange: 3 things to
+    do. Collect Iron ore: 387 bought.*
+  - you have done one, and this is the next: *Sell all 387 Iron ore at 46 each.*
+  - something more urgent has come to the top: an offer that finished, one to abort;
+  - you have done everything: *Grand Exchange: nothing left to do.*
+
+  An instruction that is only re-planned while it waits for you (after three minutes
+  unplaced, at the current price) is not read out again. The terminal and the panel
+  always show the current one.
+
 ### How it behaves
 
 - **Only your status moves the books.** Nothing is assumed bought or sold until you
   report it. An instruction that is not in your status yet is repeated unchanged — same
   order id, same price — for 3 minutes, then re-planned at current prices. If you place
   a withdrawn instruction after all and report it, it is taken back on the book.
-- **Buys**: bid 1 gp over the instant-sell. Cancelled after 30 min without a fill
-  (`--buy-timeout`), or as soon as the market has moved so the bid would lose money
-  after tax. A cancel frees the slot and the coins for a replacement in the same batch.
+- **Buys**: bid 1 gp over the instant-sell, for as many units as an hour of your share
+  of the item's volume can fill (`--order-hours`). Aborted after 30 minutes without a
+  fill, 60 once your coins, offers and stock are worth 100k (`--buy-timeout` fixes one
+  timeout for any stack). An abort frees the slot and the coins for a replacement in the
+  same batch. A bid is not aborted merely because the market has moved against it;
+  `--margin-cancel` brings that back.
 - **Sells**: listed 1 gp under the instant-buy as soon as the buy finishes (or once a
-  still-filling buy has delivered 20% of its value). After 30 min without a sale it is
-  relisted at the market (`--sell-reprice`), after 90 min at the instant-sell price
-  (`--sell-dump`) — a loss is taken and reported as one rather than left to sit. One
-  buy and one sell offer per item at a time.
+  still-filling buy has delivered 20% of its value), then left alone. After 4 hours
+  without a sale it is relisted at the market (`--sell-reprice`), after 8 hours at the
+  instant-sell price (`--sell-dump`) — a loss is taken and reported as one rather than
+  left to sit. One buy and one sell offer per item at a time.
+- **Quantities that are quick to enter and easy to hear**: a buy is rounded to one digit
+  that is not zero (400, 3,000), or to two (250, 14,000) where one would change the
+  order by more than 15% — and never to more than your coins or the buy limit allow. A
+  sell of every unit you hold of the item says `all`: it is your whole stack, so there
+  is no number to carry over (this needs your inventory in the status, which the plugin
+  writes). Place a unit more or fewer than asked and the engine follows the offer as
+  you placed it. `--no-round-quantities` gives the exact sizes back; rounding costs a
+  few percent of the profit (next section).
 - **An order missing from your status** is not guessed at: for 2 minutes the answer
   holds its slot and asks you to report it (`"needs_status": true`); after that it is
   assumed cancelled at the last count you gave, with a warning.
@@ -224,63 +255,128 @@ collected it, so its final count cannot be missed — `collected: true`.
   items cannot be sold on the GE). Live prices are single last trades; backtests see
   5-minute averages.
 
-### Fewer offers for the same money
+### How patient it is, and how many offers that takes
 
-The defaults suit someone sitting at the GE: a buy that has not filled in 30 minutes is
-replaced, and stock that has not sold is relisted after 30. That is about 800 offers to
-place or abort per day. If each offer costs you effort, give them more time:
+Every offer you place or abort is work, so the timeouts and the order size were chosen
+to ask for as few as the profit allows. Four weeks of history (Oct 14 – Nov 10), 8
+slots, N = 30 (N is explained in the next section); "offers" are offers placed or
+aborted, the things you do by hand:
+
+| Start | Earlier settings | Settings now | Profit now, as % of earlier (lowest–highest week) |
+|---|---|---|---|
+| 10k | +652k a week, 821 offers a day | +782k, 386 | 119% (96–134%) |
+| 30k | +741k, 822 | +973k, 367 | 130% (114–145%) |
+| 100k | +832k, 819 | +1.02m, 328 | 122% (95–155%) |
+| 300k | +913k, 813 | +1.28m, 296 | 139% (117–182%) |
+| 1m | +1.04m, 807 | +1.30m, 272 | 126% (113–143%) |
+
+Over the 20 week-and-size pairs: 26% more profit (95% interval 17–34%, 18 of 20 pairs
+up) from 40% of the offers, so each offer earns about three times what it did (2.6 to
+3.8 times). What changed, each step measured on the same 20 pairs against the one
+above it:
+
+| Change | Profit | Offers |
+|---|---|---|
+| **Stock is left on sale**: 4 hours before it is relisted at the market, 8 before it goes at the instant-sell price (were 30 and 90 minutes). **A bid is no longer aborted** because the market moved. **Orders are twice as big.** | +38% (30–46%; up in 20 of 20 pairs) | −51% |
+| **The stack-size rule**: a buy that is not filling gets 60 minutes instead of 30 once you have 100k | −4% (−9 to +1) | −18% |
+| **Buy quantities rounded** | −5% (−10 to 0) | +1% |
+
+In the first row it is the patient selling that earns: on its own +32% (24–41%). Not
+aborting bids and doubling the orders add nothing measurable to that (+3%, −4 to +11);
+they take the offers from about 590 a day to about 400.
+
+**The last two rows are a trade, not a gain.** Together they cost 9% of the profit
+(4–14%) and buy 18% fewer offers and quantities that are quick to enter.
+`--buy-timeout 30 --no-round-quantities` takes the profit instead.
+
+**Patience by stack size holds up less well than one week suggested.** Giving every
+buy 60 minutes made 6% less than 30 minutes (0–11%) for 21% fewer offers: 18% less
+started with 10k, between 6% less and 2% more started with 30k to 1m. That is why the
+engine keeps a small stack at 30 minutes — but the four weeks cannot tell the rule
+from a flat 60 minutes (which made 99% of the rule's profit, 94–103%), and they do not
+say where the threshold belongs. 100k is a cautious choice, not a measured optimum.
+
+**Fewer offers still**, against the settings above (starting with 10k / 100k / 1m):
+
+| | Profit | Offers a day |
+|---|---|---|
+| `--order-hours 2`: orders twice as big again | +8% (−2 to +19) | 336 / 285 / 227 |
+| `--buy-timeout 120` | −7% (−15 to +2) | 279 / 260 / 221 |
+| acting every 30 minutes instead of every 5 (`--look-every 30` in a backtest) | 63% / 78% / 91% of it | 256 / 226 / 197 |
+| acting once an hour | 30% / 46% / 69% of it | 163 / 157 / 143 |
+| at the GE 19:00–23:00 only (`--play 19-23`) | 8% / – / 31% of it | 95 / – / 54 |
+
+Bigger orders look like a free gain, but they are the one setting that can turn a
+profit into a loss (next section): raise `--order-hours` only once `--report` has shown
+the share you really get. Acting less often costs a small stack most, because it grows
+by turning over; offers keep filling while you are away, which is what a big stack
+lives on.
+
+An earlier version of this page recommended `--buy-timeout 120 --sell-reprice 120
+--sell-dump 240` from about 100k, on the strength of one week. Over four weeks it made
+97% of the earlier settings' profit (88–108%; 87% started with 10k, 112% with 300k)
+for 44% of the offers. It is withdrawn: the settings above earn more at every size.
+
+What this does not show. Four weeks is little, and differences of less than about 10%
+between settings are not real: the same week started 5–20 minutes later gave 623k–735k
+where the table's run gave 680k. When each week ended, a fifth to a half of the stack
+was in stock waiting to sell, so a market-wide drop would hurt. One item (Ascension
+shards, in the week of Oct 21) was up to a third of that week's profit. And all of it
+rests on the paper fill model.
+
+To measure other settings on your own stack:
 
 ```sh
-ge-analyser execute --buy-timeout 120 --sell-reprice 120 --sell-dump 240
-```
-
-Orders become about four times bigger (they are sized to what the buy timeout can
-fill) and are left alone for two hours. One week (Nov 3–10), 8 slots, N = 30; "offers"
-are offers placed or aborted:
-
-| Start 1m | Profit | Offers a day | gp per offer |
-|---|---|---|---|
-| default, acting every 5 min | +1.03m | 790 | 186 |
-| patient, acting every 5 min | +1.23m | 368 | 477 |
-| patient, a look every 30 min | +1.05m | 192 | 781 |
-| patient, a look every 60 min | +860k | 132 | 932 |
-
-| Start 10k | Profit | Offers a day | gp per offer |
-|---|---|---|---|
-| default, acting every 5 min | +539k | 803 | 96 |
-| patient, acting every 5 min | +419k | 334 | 179 |
-| patient, a look every 30 min | +232k | 195 | 170 |
-| patient, a look every 60 min | +162k | 143 | 163 |
-
-With 1m the patient settings earn the same or more at every N tried (105–132% of the
-default at N = 10, 30 and 100) for less than half the offers; a look every 30 minutes
-costs nothing (95–103%), every hour 2–22%. A 10k stack grows by turning over quickly,
-so there patience costs 18–34%, and looking only every 30 minutes more than half.
-In between (N = 30) the patient settings draw level with the default at about 100k
-(76% of its profit at 50k, 98% at 100k, 106% at 300k), and a look every 30 minutes
-costs 40% at 100k, 16% at 300k and nothing at 1m.
-
-This is one week of history under the paper fill model. Bigger orders held longer
-also carry more price risk than a single week shows. To try other settings on your
-own stack:
-
-```sh
-ge-analyser execute --backtest 168 --budget 1m --fill-share 30 --buy-timeout 120 --sell-reprice 120 --sell-dump 240 --look-every 30
+ge-analyser execute --backtest 168 --budget 1m --buy-timeout 30 --look-every 30
 ```
 
 The table it prints has `Offers/day` and `gp/offer` columns.
 
+### The share of volume it assumes you get
+
+A buy is sized to what an hour of *your share* of the item's volume can fill, so the
+engine has to assume a share before it has seen you trade. The paper model gives an
+order 1/N of the volume that crosses its price; the engine assumes N = 30
+(`--fill-share`), the middle of the 10–100 the backtests cover, and then corrects
+itself: once 10 of your buy orders have finished (3 for an item), order sizes are
+scaled by what really filled against what the model gives for the same orders over the
+same 5-minute windows — down to a tenth, up to double. `execute --report` prints the
+share your fills imply.
+
+Why the middle: being wrong costs in both directions, and assuming too big a share
+costs most. Profit as a percentage of what the earlier settings made *knowing* N (four
+weeks, the assumption never corrected):
+
+| You really get | Start 10k, it assumes 1/30 | Start 1m, it assumes 1/30 |
+|---|---|---|
+| 1/10 | 93% | 115% |
+| 1/30 (it is right) | 119% | 126% |
+| 1/100 | 141% | 120% |
+
+Assuming 1/100 when you get 1/10 made 57–68%: orders too small to be worth their
+slots. Assuming 1/10 when you get 1/100, with 1m to spend, made 46% and lost money in
+one week of the four: orders far bigger than the market takes off your hands again
+(measured before the stack-size rule and the rounding were added). Twice the order
+size (`--order-hours 2`) doubles that mistake too.
+
+None of these runs had the correction running: they show what a wrong assumption costs
+if it is never put right. Live, it is put right from buy orders that have finished,
+and an order that is too big finishes late — so an assumption that is too bold is the
+slowest to be corrected. With a large stack, read `--report` after your first ten buys
+before trusting the sizes.
+
 ### What re-evaluating the model found
 
 ```sh
-ge-analyser execute --backtest 168 --compare --budget 1m     # the table below, for your stack
+ge-analyser execute --backtest 168 --compare --budget 1m     # last week for your stack: N = 10, 30, 100, and a wrong assumption
 ge-analyser execute --backtest 168 --budget 1m --play 19-23  # at the GE 19:00-23:00 only; offers fill in between
 ```
 
 `--backtest` replays history through the **same engine** with a paper broker that obeys
 GE mechanics: coins reserved, slots shared, Collect once per cycle, 26 stacks. The
-engine counts its own coins as in the live loop and the broker checks the count (never
-off by a coin in any run below). What it showed:
+engine counts its own coins as in the live loop and the broker checks the count: in the
+713 week-long runs behind this page it was never off by a coin, and the engine never
+asked for an offer that could not be placed. What it showed:
 
 1. **One freak print carried the old results.** During the first live paper run a junk
    item (Steel knife(p+)) printed ~5,500 units at 49,999 gp in 20 minutes — almost
@@ -291,40 +387,41 @@ off by a coin in any run below). What it showed:
    of the backtest profit came from Old school bonds, which cannot be flipped at all.
    They are excluded.
 3. **The result hangs on one unknown: the share of volume you get.** The paper model
-   gives an order 1/N of the volume that crosses its price. Profit over one week
-   (Nov 3–10), all items, 8 slots, at the GE around the clock:
+   gives an order 1/N of the volume that crosses its price. Profit a week with the
+   settings now, mean of four weeks (lowest–highest week), all items, 8 slots, at the
+   GE around the clock, the engine knowing N:
 
    | Start | N = 10 | N = 30 | N = 100 |
    |---|---|---|---|
-   | 10k | +1.50m | +539k | +182k |
-   | 1m | +2.24m | +1.03m | +369k |
-   | 10m | +2.43m | +891k | +368k |
-   | 100m | | +891k | |
-   | 10k, free-to-play (3 slots) | +127k | +103k | +72k |
+   | 10k | +1.88m (1.43m–2.93m) | +782k (578k–1.13m) | +304k (231k–487k) |
+   | 1m | +3.29m (2.26m–4.51m) | +1.30m (1.16m–1.57m) | +539k (323k–675k) |
+   | 10m | +3.30m (2.89m–3.84m) | +1.44m (1.20m–1.60m) | +541k (373k–724k) |
+   | 100m | | +1.44m (1.20m–1.60m) | |
+   | 10k, free-to-play (3 slots) | +128k (89k–190k) | +85k (69k–99k) | +48k (32k–63k) |
 
-   Start the same run 5–20 minutes later and the profit moves by about ±10% (491k–586k
-   for the 10k / N = 30 cell), so smaller differences mean nothing. No single item is
-   more than 14% of the profit at 10k; with 1m+ and N = 100, Chaos runes are 47%.
+   Against the earlier settings in the same weeks, started with 10k and with 1m: 112%
+   and 132% at N = 10, 119% and 126% at N = 30, 145% and 172% at N = 100; free-to-play
+   106% (84–120%) at N = 30. At worst one item was a third of a week's profit at
+   N = 30 (Ascension shards, week of Oct 21) and 40% at N = 10; with 1m or more at
+   N = 100 Chaos runes were up to half, and free-to-play Gold bars up to 46%.
 4. **Profit is capped by market flow, not by your stack.** Orders are sized to what an
    item really trades, so from about 1m up a bigger stack earns the same gp: 100m makes
    exactly what 10m makes. Admitting thinner, pricier items (`--min-volume 10`) did not
    help in a 24-hour test. This is a strategy for cheap, liquid items.
-5. **It is a lot of clicking for the gp.** With the default settings, about 34 offers
-   placed or aborted per hour with 8 slots (14 with 3): 30–450 gp per offer, or 1k–14k
-   gp per hour at the GE, depending on N and stack. Giving offers more time halves the
-   offers, and from a 1m stack that costs nothing even if you then look only every 30
-   minutes — see "Fewer offers for the same money" above. Four hours a day
-   (`--play 19-23`, N = 30) keeps 26–40% of the weekly profit for a 1m+ stack because
-   offers fill while you are away (+271k from 1m, 9.7k gp/h at the GE); a 10k stack
-   loses its compounding (+51k instead of +539k).
-6. **Real mechanics cost 12–26% against the old simulator** on the same data and N
-   (+1.50m vs +1.71m from 10k, +2.24m vs +3.01m from 1m; nothing with 3 free-to-play
-   slots). The 26-stack limit never binds: at most 8 stacks were ever held.
+5. **It is still a lot of offers for the gp.** 250–400 offers placed or aborted a day
+   with 8 slots, about 220 with 3: 100–1,700 gp an offer with 8 slots (35–80 with 3), or
+   2k–20k gp an hour around the clock (300–800 with 3), depending on N and stack. Four
+   hours a day (`--play 19-23`, N = 30) keeps 31% of the weekly profit for a 1m stack,
+   because offers fill while you are away (+391k a week from 54 offers a day, 14k gp per
+   hour at the GE); a 10k stack keeps 8% (+62k), having lost its compounding.
+6. **Real mechanics cost 12–26% against the old simulator** on the same data and N.
+   That was measured with the earlier settings, whose 30-minute patience the old
+   simulator shares (+1.50m vs +1.71m from 10k, +2.24m vs +3.01m from 1m, week of Nov 3;
+   nothing with 3 free-to-play slots). The 26-stack limit never binds: at most 8 stacks
+   were ever held.
 
-What no backtest can know is N. The loop measures it: `execute --report` compares each
-finished order with what the paper model gives for the same order over the same
-5-minute windows. After 10 finished buy orders that ratio starts scaling order sizes
-(per item after 3); below 1.0 means the table overstates, and by how much.
+What no backtest can know is N. The loop measures it from your own fills and
+`execute --report` prints it: see "The share of volume it assumes you get" above.
 
 ## Buy-limit tracking
 
@@ -388,7 +485,7 @@ Fill model (conservative by default, tunable):
 | Rule | Flag |
 |------|------|
 | A buy fills only when a later print's instant-sell goes **below** our bid; a sell only when instant-buy goes **above** our ask (price-time priority: at a touched price you're queued behind everyone already there). | `--loose` to fill on touch (very optimistic) |
-| Each print fills at most 1/N of that window's one-sided volume. | `--fill-share N` (default 10) |
+| Each print fills at most 1/N of that window's one-sided volume. | `--fill-share N` (default 10 here; `execute` assumes 30) |
 | Fills happen at our offer price, never the better print. | — |
 | Only enter flips with ≥ 2 gp and ≥ 2% margin after tax; 1-gp spreads on bot items aren't real money for a solo flipper. | `--min-margin`, `--min-roi` |
 

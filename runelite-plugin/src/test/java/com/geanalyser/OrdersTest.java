@@ -73,6 +73,15 @@ public class OrdersTest
 	}
 
 	@Test
+	public void aSellOfEverythingYouHoldSaysSo()
+	{
+		Orders.Action sell = GSON.fromJson("{'action': 'SELL', 'item': 'Iron ore', 'side': 'sell', 'qty': 387, 'price': 46, 'all': true}", Orders.Action.class);
+		assertEquals("all 387 × 46 gp each", sell.detail());
+		Orders.Action part = GSON.fromJson("{'action': 'SELL', 'item': 'Iron ore', 'side': 'sell', 'qty': 387, 'price': 46}", Orders.Action.class);
+		assertEquals("387 × 46 gp each", part.detail()); // you hold more than the engine sells: this many, typed in
+	}
+
+	@Test
 	public void anAnswerIsShownWhileItIsKeptAndAnOldOneOnlyForWantOfAdvice()
 	{
 		Orders answer = GSON.fromJson("{'ts': 1000, 'error': 'no status.json yet', 'actions': []}", Orders.class);

@@ -83,6 +83,7 @@ public class Orders
 		private Long filled;
 		@SerializedName("collect_first")
 		private List<Long> collectFirst;
+		private Boolean all; // sells: the quantity is all you hold of the item
 		private String why;
 
 		/** Something to do at the GE, as opposed to an offer or a stack to leave alone. */
@@ -102,7 +103,8 @@ public class Orders
 		{
 			if ("BUY".equals(action) || "SELL".equals(action))
 			{
-				return units(qty) + " × " + units(price) + " gp each";
+				// "all": every unit of it in your inventory, so the GE's All button sets the quantity.
+				return (Boolean.TRUE.equals(all) ? "all " : "") + units(qty) + " × " + units(price) + " gp each";
 			}
 			String offer = side == null ? "offer" : side + " offer";
 			if (qty == null || price == null)

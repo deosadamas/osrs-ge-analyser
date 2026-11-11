@@ -330,9 +330,12 @@ class ExecState:
 class ExecConfig:
     slots: int = 8
     inventory_slots: int = 26  # item stacks you can hold (notes: one stack per item type)
-    buy_timeout: int = 30 * 60  # cancel a buy that has not filled anything for this long
-    sell_reprice: int = 30 * 60  # relist a sell at the market after this long without a sale
-    sell_dump: int = 90 * 60  # sell at the instant-sell price once a lot has been listed this long
+    # Timeouts chosen on four weeks of history: README, "How patient it is, and how many offers that takes".
+    buy_timeout: int = 30 * 60  # abort a buy that has not filled anything for this long...
+    buy_timeout_big: int = 60 * 60  # ...and for this long once your equity has reached `big_stack`
+    big_stack: int = 100_000  # coins; 0 = the same timeout whatever you have
+    sell_reprice: int = 4 * 3600  # relist a sell at the market after this long without a sale
+    sell_dump: int = 8 * 3600  # sell at the instant-sell price once a lot has been listed this long
     dump_retry: int = 10 * 60
     pending_ttl: int = 180  # keep repeating an instruction unchanged this long before re-planning it
     missing_grace: int = 120  # an order missing from the status is asked about this long, then assumed cancelled
@@ -342,12 +345,17 @@ class ExecConfig:
     min_margin: int = 2
     min_roi: float = 0.02
     improve: bool = True  # bid 1 gp over the instant-sell, ask 1 gp under the instant-buy
-    fill_share: int = 10  # share of crossing volume one order is expected to get: 1/fill_share
-    volume_frac: float | None = None  # size orders to this share of hourly volume (None: buy_timeout / fill_share)
+    # The share of the volume crossing its price that an order is assumed to get, 1/fill_share,
+    # until your own fills say otherwise. 30 is the middle of the 10-100 the backtests cover:
+    # assuming too big a share sizes orders too big, and that is the mistake that costs.
+    fill_share: int = 30
+    order_hours: float = 1.0  # a buy is sized to what this many hours of that share of the item's volume can fill
+    volume_frac: float | None = None  # ...or to this share of the item's hourly volume outright
     partial_sell_frac: float = 0.2  # list a still-filling buy's units once they are worth this share of the order
-    cancel_on_margin: bool = True
+    cancel_on_margin: bool = False  # abort a buy as soon as the market has moved so that it would lose after tax
     margin_cap: float = MARGIN_CAP  # plan asks at most this multiple of the item's typical margin over cost (0 = off)
     min_order_frac: float = 0.02  # a new buy must be worth at least this share of your equity: no dust orders
+    round_quantities: bool = True  # buy quantities with one or two digits that are not zero: quick to enter, easy to hear
     score: ScoreParams = DEFAULT_PARAMS
 
 
@@ -383,6 +391,25 @@ class Plan:
             "fills_booked": [asdict(f) for f in self.fills],
             "reply_template": self.reply_template,
         }
+
+
+# ---- quantities that are quick to enter ---------------------------------------
+
+
+def easy_quantity(q: int, most: int) -> int:
+    """`q` with one digit that is not zero (300, 2,000, 40), or with two (250, 14,000) when
+    one would change it by more than 15%: quick to enter, easy to hear. Never above `most`."""
+    if q < 10:
+        return q
+    best = q
+    for digits in (1, 2):
+        unit = 10 ** max(len(str(q)) - digits, 0)
+        below = q // unit * unit
+        above = below + unit if below < q else below
+        best = above if above <= most and above - q <= q - below else below  # 150 -> 200: halves go up
+        if abs(best - q) * 100 <= 15 * q:
+            break
+    return best
 
 
 # ---- engine ----------------------------------------------------------------
@@ -661,7 +688,7 @@ class Executor:
         return foreign, foreign_items
 
     # -- decisions on orders already in the GE --------------------------------
-    def _review(self, o: ExecOrder, lp: LatestPrice | None, now: int) -> tuple[str, str]:
+    def _review(self, o: ExecOrder, lp: LatestPrice | None, now: int, buy_timeout: int) -> tuple[str, str]:
         cfg = self.cfg
         if o.cancel_requested:
             return "CANCEL", "abort and collect (asked earlier, still open)"
@@ -673,7 +700,7 @@ class Executor:
                 margin = self._margin_now(o.price, o.name, lp, o.target)
                 if margin < 1:
                     return "CANCEL", f"margin gone: instant-buy is now {lp.high:,}, your bid {o.price:,} would lose after tax"
-            if idle >= cfg.buy_timeout:
+            if idle >= buy_timeout:
                 return "CANCEL", f"no fill for {idle // 60}m ({o.filled:,}/{o.qty:,}); free the slot and the coins"
             return "HOLD", f"buying {progress}"
         pos = self.state.positions.get(o.item_id)
@@ -690,7 +717,7 @@ class Executor:
         return "HOLD", f"selling {progress}"
 
     # -- new sell offers for stock we hold ------------------------------------
-    def _plan_sells(self, market: Market, now: int, free: int, sell: list[dict], hold: list[dict]) -> int:
+    def _plan_sells(self, market: Market, now: int, free: int, sell: list[dict], hold: list[dict], inventory: dict[int, int] | None) -> int:
         st, cfg = self.state, self.cfg
         # The stock a sell instruction was for can be gone before it is placed (the offer
         # it was to replace sold after all): nothing is left to list, and the item is free again.
@@ -734,6 +761,8 @@ class Executor:
             extra: dict[str, Any] = {"cost_each": round(pos.cost, 2), "profit_each": round(each, 2)}
             if boxed:
                 extra["collect_first"] = boxed
+            if inventory is not None and inventory.get(item_id) == o.qty:
+                extra["all"] = True  # every unit of it you hold: no quantity to enter, the GE's "All" does it
             sell.append(self._line("SELL", o, f"{label}: cost {pos.cost:,.1f}, {each:+,.1f}/ea after tax", **extra))
             free -= 1
         return free
@@ -771,9 +800,13 @@ class Executor:
             return
         spread = min(free, cash // floor)
         busy = set(st.positions) | {o.item_id for o in st.orders} | avoid
-        base = cfg.volume_frac if cfg.volume_frac is not None else (cfg.buy_timeout / 3600) / cfg.fill_share
+        base = cfg.volume_frac if cfg.volume_frac is not None else cfg.order_hours / cfg.fill_share
         scale, default = market.volume_scale, market.default_scale
-        frac = (lambda i: base * scale.get(i, default)) if (scale or default != 1.0) else base
+
+        def share(item_id: int) -> float:
+            """An order's size as a share of the item's hourly volume."""
+            return base * scale.get(item_id, default)
+
         flips = find_flips(
             self.items,
             market.latest,
@@ -788,7 +821,7 @@ class Executor:
             used=market.used,
             stats=market.stats,
             params=cfg.score,
-            volume_frac=frac,
+            volume_frac=share,
             require_history=market.stats is not None,
         )
         for f in flips:
@@ -812,6 +845,9 @@ class Executor:
             qty = min(f.quantity, cash // bid)
             if qty <= 0:
                 continue
+            if cfg.round_quantities:
+                most = cash // bid if f.item.limit <= 0 else min(cash // bid, f.limit_left)
+                qty = easy_quantity(qty, most)
             o = self._new_order("buy", f.item.id, bid, qty, now, target=target)
             fill = f"{f.stats.p_fill * 100:.0f}%" if f.stats and f.stats.windows else "?"
             why = f"+{each:,}/ea selling at {target:,} ({each / bid * 100:.1f}%), fill chance {fill}, {f.liquidity:,} traded/h"
@@ -866,11 +902,18 @@ class Executor:
             st.cash_given = status.cash
         coins = st.cash_anchor + st.flow - reserved
 
+        stock = 0
+        for i, p in st.positions.items():
+            lp = market.latest.get(i)
+            stock += p.qty * (lp.low if lp and lp.low else int(p.cost))
+        equity = coins + reserved + stock
+        buy_timeout = cfg.buy_timeout_big if cfg.big_stack and equity >= cfg.big_stack else cfg.buy_timeout
+
         freed_cash = 0
         for o in list(st.orders):
             if o.state != "working" or o.missing_since:
                 continue
-            verdict, why = self._review(o, market.latest.get(o.item_id), now)
+            verdict, why = self._review(o, market.latest.get(o.item_id), now, buy_timeout)
             if verdict == "CANCEL":
                 if not o.cancel_requested:
                     o.cancel_requested = now
@@ -890,15 +933,10 @@ class Executor:
         if len(held) > capacity:
             warnings.append(f"{len(held)} item stacks held or incoming but capacity is {capacity}: no new items until some sell")
 
-        stock = 0
-        for i, p in st.positions.items():
-            lp = market.latest.get(i)
-            stock += p.qty * (lp.low if lp and lp.low else int(p.cost))
-        equity = coins + reserved + stock
         if not st.start_ts:
             st.start_ts, st.start_equity = now, equity
 
-        free = self._plan_sells(market, now, free, sell, hold)
+        free = self._plan_sells(market, now, free, sell, hold, status.inventory)
         self._plan_buys(market, now, free, cash, held, capacity, members, buy, equity, foreign_items)
 
         actions = [{"step": n, **a} for n, a in enumerate(collect + cancel + sell + buy + hold, 1)]

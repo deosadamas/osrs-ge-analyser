@@ -158,8 +158,8 @@ def remaining_limit(item: ItemInfo, used: int) -> int:
 
 
 # Share of an hour's two-sided volume one order is sized to. The ranking commands and
-# the legacy simulator use 1/4; the execution engine passes the share it expects to be
-# filled within its buy timeout (and scales it by what your real fills show).
+# the legacy simulator use 1/4; the execution engine passes the share of the volume it
+# assumes you get over `order_hours` (and scales it by what your real fills show).
 DEFAULT_VOLUME_FRAC = 0.25
 
 
