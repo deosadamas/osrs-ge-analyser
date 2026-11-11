@@ -18,9 +18,23 @@ budget the advice was computed for and how old it is (red when > 10 min).
 Two processes:
 
 ```sh
-# 1. keep the advice file fresh (every 60 s)
+# 1a. generic suggestions, refreshed every 60 s
 ge-analyser advise --budget 10m --top 15
+# 1b. ...or mirror the live paper-trading agent: exactly the offers it has open right now
+ge-analyser advise --from-agent
 
+# 2. RuneLite with the plugin (sideloaded; no Plugin Hub review needed for personal use)
+cd runelite-plugin
+./gradlew test --tests GeAnalyserPluginTest     # dev launcher, or run that class from an IDE
+```
+
+In `--from-agent` mode each row is an order to have in the GE: `BUY Gold ore — 24,182 × 111 gp
+each — then sell @ 114 (+1/ea)` or `SELL Ruby bolts (e) — 2,282 × 195 gp each — cost 187`.
+Sells are listed first because they free slots. The header shows the agent's equity and
+realised P&L. Anything you have open that is not on the list is something the agent has
+cancelled. For a machine-readable stream of the agent's decisions run it with
+`simulate --ticks 0 --events ~/.osrs-ge-analyser/agent-events.jsonl`: one JSON line per
+`offer` / `fill` / `cancel` / `reprice` / `dump` with item, qty, price and side.
 # 2. RuneLite with the plugin (sideloaded; no Plugin Hub review needed for personal use)
 cd runelite-plugin
 ./gradlew test --tests GeAnalyserPluginTest     # dev launcher, or run that class from an IDE

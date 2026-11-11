@@ -63,7 +63,15 @@ class GeAnalyserPanel extends PluginPanel
 	void show(Advice advice, int maxRows)
 	{
 		long age = Instant.now().getEpochSecond() - advice.getTs();
-		status.setText(String.format("budget %s · updated %s ago", gp(advice.getBudget()), ageText(age)));
+		Advice.Agent agent = advice.getAgent();
+		if (agent != null)
+		{
+			status.setText(String.format("agent equity %s · realised %s · %s ago", gp(agent.getEquity()), gp(agent.getRealised()), ageText(age)));
+		}
+		else
+		{
+			status.setText(String.format("budget %s · updated %s ago", gp(advice.getBudget()), ageText(age)));
+		}
 		status.setForeground(age > 600 ? ColorScheme.PROGRESS_ERROR_COLOR : ColorScheme.LIGHT_GRAY_COLOR);
 
 		rows.removeAll();
@@ -94,17 +102,40 @@ class GeAnalyserPanel extends PluginPanel
 		p.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
 		p.setMaximumSize(new Dimension(Integer.MAX_VALUE, 56));
 
-		JLabel name = new JLabel(f.getName());
+		String side = f.getSide() == null ? "flip" : f.getSide();
+		boolean isBuy = side.equals("buy");
+		boolean isSell = side.equals("sell");
+
+		JLabel name = new JLabel((isBuy ? "BUY  " : isSell ? "SELL " : "") + f.getName());
 		name.setFont(FontManager.getRunescapeBoldFont());
-		name.setForeground(f.getLimitLeft() == 0 && f.getLimit() > 0 ? ColorScheme.PROGRESS_ERROR_COLOR : Color.WHITE);
+		name.setForeground(f.getLimitLeft() == 0 && f.getLimit() > 0 && !isSell ? ColorScheme.PROGRESS_ERROR_COLOR
+			: isBuy ? ColorScheme.PROGRESS_COMPLETE_COLOR : isSell ? ColorScheme.BRAND_ORANGE : Color.WHITE);
 
-		JLabel prices = new JLabel(String.format("buy %s  →  sell %s   +%s/ea", gp(f.getBuy()), gp(f.getSell()), gp(f.getMargin())));
+		JLabel prices;
+		JLabel detail;
+		if (isBuy)
+		{
+			// Mirror of an open agent bid: place this exact offer.
+			prices = new JLabel(String.format("%s × %s gp each", gp(f.getQty()), gp(f.getBuy())));
+			String target = f.getSell() > 0 ? "then sell @ " + gp(f.getSell()) + " (+" + gp(f.getMargin()) + "/ea)" : "";
+			String mkt = f.getMarket() == null ? "" : " · market " + gp(f.getMarket());
+			detail = new JLabel(target + mkt + " · " + ageText(f.getAge()));
+		}
+		else if (isSell)
+		{
+			prices = new JLabel(String.format("%s × %s gp each", gp(f.getQty()), gp(f.getSell())));
+			String mkt = f.getMarket() == null ? "" : " · market " + gp(f.getMarket());
+			detail = new JLabel("cost " + gp(f.getBuy()) + " (+" + gp(f.getMargin()) + "/ea)" + mkt + " · " + ageText(f.getAge()));
+		}
+		else
+		{
+			prices = new JLabel(String.format("buy %s  →  sell %s   +%s/ea", gp(f.getBuy()), gp(f.getSell()), gp(f.getMargin())));
+			String fill = f.getFill() == null ? "?" : Math.round(f.getFill() * 100) + "%";
+			String limit = f.getLimit() > 0 ? gp(f.getLimitLeft()) + "/" + gp(f.getLimit()) : "-";
+			detail = new JLabel(String.format("qty %s · limit %s · fill %s · exp %s", gp(f.getQty()), limit, fill, gp(f.getExpect())));
+		}
 		prices.setFont(FontManager.getRunescapeSmallFont());
-		prices.setForeground(ColorScheme.BRAND_ORANGE);
-
-		String fill = f.getFill() == null ? "?" : Math.round(f.getFill() * 100) + "%";
-		String limit = f.getLimit() > 0 ? gp(f.getLimitLeft()) + "/" + gp(f.getLimit()) : "-";
-		JLabel detail = new JLabel(String.format("qty %s · limit %s · fill %s · exp %s", gp(f.getQty()), limit, fill, gp(f.getExpect())));
+		prices.setForeground(Color.WHITE);
 		detail.setFont(FontManager.getRunescapeSmallFont());
 		detail.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 		detail.setHorizontalAlignment(SwingConstants.LEFT);

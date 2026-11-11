@@ -5,7 +5,7 @@ import java.util.List;
 import java.util.Map;
 import lombok.Data;
 
-/** Mirror of the JSON written by `ge-analyser advise`. */
+/** Mirror of the JSON written by `ge-analyser advise` (ranking) or `advise --from-agent` (agent mirror). */
 @Data
 public class Advice
 {
@@ -13,6 +13,8 @@ public class Advice
 	private long budget;
 	private List<Flip> flips;
 	private Map<String, Limit> limits;
+	private Agent agent; // present only in --from-agent mode
+	private List<Event> events;
 
 	@Data
 	public static class Flip
@@ -31,6 +33,9 @@ public class Advice
 		private Double fill;
 		private long expect;
 		private long age;
+		private String side; // "flip" (ranking), "buy" or "sell" (an agent order to mirror)
+		private Long filled;
+		private Long market;
 	}
 
 	@Data
@@ -39,5 +44,23 @@ public class Advice
 		private long used;
 		private long limit;
 		private Long resets;
+	}
+
+	@Data
+	public static class Agent
+	{
+		private long equity;
+		private long cash;
+		private long realised;
+		private long ticks;
+		@SerializedName("last_tick")
+		private long lastTick;
+	}
+
+	@Data
+	public static class Event
+	{
+		private long t;
+		private String msg;
 	}
 }

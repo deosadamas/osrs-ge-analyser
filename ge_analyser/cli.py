@@ -386,6 +386,13 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
         _print_sim(state, snap, int(time.time()))
         return
 
+    events_file = None
+    if args.events:
+        events_path = Path(args.events).expanduser()
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        events_file = events_path.open("a", encoding="utf-8")
+        sim.events = lambda ev: (events_file.write(json.dumps(ev) + "\n"), events_file.flush())
+
     n = 0
     failures = 0
     while args.ticks == 0 or n < args.ticks:
@@ -602,8 +609,44 @@ def advice_path() -> Path:
     return Path.home() / ".osrs-ge-analyser" / "advice.json"
 
 
+def _agent_payload(state: State, items: dict[int, ItemInfo], ledger: Ledger, now: int, snap: Snapshot) -> dict:
+    """Mirror of the agent's open orders: what to have placed in the GE right now."""
+    rows = []
+    for o in state.orders:
+        item = items.get(o.item_id)
+        tick = snap.get(o.item_id)
+        if o.kind == "buy":
+            margin = o.target - ge_tax(o.target, o.name) - o.price if o.target else 0
+            rows.append({
+                "id": o.item_id, "name": o.name, "side": "buy", "buy": o.price, "sell": o.target, "margin": margin,
+                "qty": o.remaining, "filled": o.filled, "limit": item.limit if item else 0,
+                "limit_left": remaining_limit(item, ledger.used(now).get(o.item_id, 0)) if item else 0,
+                "market": tick.low if tick else None, "age": now - o.placed, "expect": margin * o.remaining,
+            })
+        else:
+            margin = o.price - ge_tax(o.price, o.name) - o.cost_basis
+            rows.append({
+                "id": o.item_id, "name": o.name, "side": "sell", "buy": o.cost_basis, "sell": o.price, "margin": margin,
+                "qty": o.remaining, "filled": o.filled, "limit": item.limit if item else 0, "limit_left": 0,
+                "market": tick.high if tick else None, "age": now - o.placed, "expect": margin * o.remaining,
+            })
+    rows.sort(key=lambda r: (r["side"] != "sell", -r["expect"]))  # sells first: they free slots
+    events = []
+    for line in state.log[-20:]:
+        ts, msg = line.split("\t", 1)
+        events.append({"t": int(ts), "msg": msg})
+    return {
+        "ts": now,
+        "budget": state.equity(snap),
+        "agent": {"equity": state.equity(snap), "cash": state.cash, "realised": state.realised, "ticks": state.ticks, "last_tick": state.last_tick},
+        "flips": rows,
+        "events": events,
+        "limits": {},
+    }
+
+
 def cmd_advise(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
-    """Write the current top flips and remaining limits as JSON for the RuneLite plugin."""
+    """Write the current top flips (or the agent's open orders) and remaining limits as JSON for the RuneLite plugin."""
     out = Path(args.out).expanduser() if args.out else advice_path()
     n = 0
     while True:
@@ -611,39 +654,47 @@ def cmd_advise(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> No
         try:
             items = client.mapping()
             latest = client.latest()
-            hour = client.hourly()
-            stats = _stats(args, client, items, now)
+            if args.from_agent:
+                sim_path = _sim_path()
+                if not sim_path.exists():
+                    sys.exit(f"No agent state at {sim_path}; start `ge-analyser simulate --ticks 0` first.")
+                state = State.load(sim_path)
+                payload = _agent_payload(state, items, ledger, now, snapshot_from_live(latest, client.window("5m")))
+                flips = payload["flips"]
+            else:
+                hour = client.hourly()
+                stats = _stats(args, client, items, now)
+                used = _used(args, ledger, now)
+                flips = find_flips(
+                    items, latest, hour, budget=parse_gp(args.budget), now=now,
+                    min_volume=args.min_volume, min_margin=args.min_margin, min_roi=args.min_roi / 100,
+                    max_age_s=args.max_age * 60, members=_members_filter(args), used=used,
+                    stats=stats,
+                )[: args.top]
+                payload = {
+                    "ts": now,
+                    "budget": parse_gp(args.budget),
+                    "flips": [
+                        {
+                            "id": f.item.id, "name": f.item.name, "side": "flip",
+                            "buy": f.buy + (1 if args.improve and f.margin > 2 else 0),
+                            "sell": f.sell - (1 if args.improve and f.margin > 2 else 0),
+                            "margin": f.margin - (2 if args.improve and f.margin > 2 else 0),
+                            "roi": round(f.roi, 4), "qty": f.quantity, "limit": f.item.limit, "limit_left": f.limit_left,
+                            "volume": f.liquidity, "fill": round(f.stats.p_fill, 3) if f.stats else None,
+                            "expect": f.expected_profit, "age": f.price_age_s,
+                        }
+                        for f in flips
+                    ],
+                    "limits": {
+                        str(i): {"used": q, "limit": items[i].limit, "resets": ledger.resets_at(i, now)}
+                        for i, q in used.items() if i in items
+                    },
+                }
         except (OSError, ValueError, KeyError) as e:
             print(f"{time.strftime('%H:%M:%S')} fetch failed ({type(e).__name__}: {e}); retrying in {args.interval}s", flush=True)
             time.sleep(args.interval)
             continue
-        used = _used(args, ledger, now)
-        flips = find_flips(
-            items, latest, hour, budget=parse_gp(args.budget), now=now,
-            min_volume=args.min_volume, min_margin=args.min_margin, min_roi=args.min_roi / 100,
-            max_age_s=args.max_age * 60, members=_members_filter(args), used=used,
-            stats=stats,
-        )[: args.top]
-        payload = {
-            "ts": now,
-            "budget": parse_gp(args.budget),
-            "flips": [
-                {
-                    "id": f.item.id, "name": f.item.name,
-                    "buy": f.buy + (1 if args.improve and f.margin > 2 else 0),
-                    "sell": f.sell - (1 if args.improve and f.margin > 2 else 0),
-                    "margin": f.margin - (2 if args.improve and f.margin > 2 else 0),
-                    "roi": round(f.roi, 4), "qty": f.quantity, "limit": f.item.limit, "limit_left": f.limit_left,
-                    "volume": f.liquidity, "fill": round(f.stats.p_fill, 3) if f.stats else None,
-                    "expect": f.expected_profit, "age": f.price_age_s,
-                }
-                for f in flips
-            ],
-            "limits": {
-                str(i): {"used": q, "limit": items[i].limit, "resets": ledger.resets_at(i, now)}
-                for i, q in used.items() if i in items
-            },
-        }
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -768,7 +819,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--no-improve", dest="improve", action="store_false", help="quote exact instant prices instead of 1 gp better")
     a.add_argument("--interval", type=int, default=60, help="seconds between refreshes (default 60)")
     a.add_argument("--ticks", type=int, default=0, help="refreshes to run (0 = forever)")
-    a.add_argument("--out", help=f"output file (default ~/.osrs-ge-analyser/advice.json)")
+    a.add_argument("--out", help="output file (default ~/.osrs-ge-analyser/advice.json)")
+    a.add_argument("--from-agent", action="store_true", help="mirror the live agent's open orders (GE_ANALYSER_SIM) instead of the generic ranking")
     a.set_defaults(func=cmd_advise)
 
     i = sub.add_parser("item", help="detail + trend for one item (name or id)")
@@ -811,6 +863,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--compare", action="store_true", help="backtest: run with and without history features and compare")
     s.add_argument("--status", action="store_true", help="show the live simulation portfolio and exit")
     s.add_argument("--reset", action="store_true", help="delete the live simulation state")
+    s.add_argument("--events", metavar="PATH", help="append one JSON line per decision (offer/fill/cancel/reprice/dump) to this file")
     s.set_defaults(func=cmd_simulate)
 
     h = sub.add_parser("history", help="backfill / top up the local market history (5m, 1h and daily, all items)")

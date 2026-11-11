@@ -53,6 +53,7 @@ class Order:
     placed: int
     cost_basis: int = 0  # per-unit buy price, sells only
     repriced: bool = False
+    target: int = 0  # buys only: the ask we intend to list at once filled
 
     @property
     def remaining(self) -> int:
@@ -150,6 +151,7 @@ class Simulator:
         self.cfg = config
         # Per-item history features for a given moment (time-of-week aware); None = legacy scoring.
         self.stats_at: Callable[[int], dict[int, ItemStats]] | None = None
+        self.events: Callable[[dict], None] | None = None  # structured decision sink (see `simulate --events`)
 
     def usable_slots(self) -> int:
         # Equity proxy without a snapshot: cash + reserved + positions at cost.
@@ -161,8 +163,12 @@ class Simulator:
         self.state.log.append(f"{now}\t{msg}")
         del self.state.log[:-200]
 
-    def _new_order(self, kind: str, item: ItemInfo, price: int, qty: int, now: int, cost_basis: int = 0) -> Order:
-        o = Order(self.state.next_order_id, kind, item.id, item.name, price, qty, 0, now, cost_basis)
+    def _event(self, now: int, kind: str, item: ItemInfo, qty: int, price: int, **extra) -> None:
+        if self.events:
+            self.events({"t": now, "kind": kind, "id": item.id, "name": item.name, "qty": qty, "price": price, **extra})
+
+    def _new_order(self, kind: str, item: ItemInfo, price: int, qty: int, now: int, cost_basis: int = 0, target: int = 0) -> Order:
+        o = Order(self.state.next_order_id, kind, item.id, item.name, price, qty, 0, now, cost_basis, target=target)
         self.state.next_order_id += 1
         self.state.orders.append(o)
         return o
@@ -208,6 +214,7 @@ class Simulator:
             ask -= 1
         self._list_for_sale(self.items[o.item_id], qty, price, ask, now)
         self._log(now, f"BUY  {qty:,} x {o.name} @ {price:,} -> listing @ {ask:,}")
+        self._event(now, "fill", self.items[o.item_id], qty, price, side="buy", ask=ask)
         if o.remaining == 0:
             self.state.orders.remove(o)
 
@@ -221,6 +228,7 @@ class Simulator:
                 o.price, o.placed, o.repriced = ask, now, False
                 return
         self._new_order("sell", item, ask, qty, now, cost_basis=cost)
+        self._event(now, "offer", item, qty, ask, side="sell", cost=cost)
 
     def _fill_sell(self, o: Order, tick: Tick, now: int) -> None:
         if tick.high is None or tick.high_time <= o.placed:
@@ -239,6 +247,7 @@ class Simulator:
         self.state.cash += proceeds
         self.state.trades.append(Trade(now, "sell", o.item_id, o.name, qty, price, tax * qty, profit))
         self._log(now, f"SELL {qty:,} x {o.name} @ {price:,} (tax {tax * qty:,}) profit {profit:+,}")
+        self._event(now, "fill", self.items[o.item_id], qty, price, side="sell", profit=profit)
         if o.remaining == 0:
             self.state.orders.remove(o)
 
@@ -250,15 +259,18 @@ class Simulator:
                 self.state.cash += o.price * o.remaining
                 self.state.orders.remove(o)
                 self._log(now, f"CANCEL buy {o.remaining:,} x {o.name} @ {o.price:,} (unfilled {age // 60}m)")
+                self._event(now, "cancel", self.items[o.item_id], o.remaining, o.price, side="buy")
             elif o.kind == "sell":
                 tick = snapshot.get(o.item_id)
                 if tick is None:
                     continue
                 if age >= self.cfg.sell_dump and tick.low and tick.low < o.price:
                     self._log(now, f"DUMP {o.name}: {o.remaining:,} @ instant-sell {tick.low:,} after {age // 60}m")
+                    self._event(now, "dump", self.items[o.item_id], o.remaining, tick.low, side="sell", was=o.price)
                     self._execute_sell(o, tick.low, o.remaining, now)
                 elif not o.repriced and age >= self.cfg.sell_reprice and tick.high and tick.high < o.price:
                     self._log(now, f"REPRICE {o.name}: {o.price:,} -> {tick.high:,} after {age // 60}m")
+                    self._event(now, "reprice", self.items[o.item_id], o.remaining, tick.high, side="sell", was=o.price)
                     o.price, o.repriced = tick.high, True
 
     # ---- decisions -----------------------------------------------------
@@ -299,10 +311,11 @@ class Simulator:
             if qty <= 0:
                 continue
             self.state.cash -= bid * qty
-            placed.append(self._new_order("buy", f.item, bid, qty, now))
+            placed.append(self._new_order("buy", f.item, bid, qty, now, target=target))
             active.add(f.item.id)
             free -= 1
             self._log(now, f"OFFER buy {qty:,} x {f.item.name} @ {bid:,} (target {target:,}, margin {target - ge_tax(target, f.item.name) - bid:,}/unit)")
+            self._event(now, "offer", f.item, qty, bid, side="buy", target=target)
         return placed
 
     # ---- one full step -------------------------------------------------
