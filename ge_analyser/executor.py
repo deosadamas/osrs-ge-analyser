@@ -1,8 +1,8 @@
 """Human-in-the-loop execution engine.
 
-Nothing here touches the game. Each cycle the engine is given a *status* - the coins
-you can spend, the orders you have in the Grand Exchange and how far each has filled,
-optionally your inventory - and answers with a complete, ordered list of actions:
+Nothing here touches the game. Each cycle the engine is given a *status* - the orders
+you have in the Grand Exchange and how far each has filled, optionally your coins and
+inventory - and answers with a complete, ordered list of actions:
 
     COLLECT  an order finished or was aborted: collect it, its slot is free
     CANCEL   abort this order and collect what it holds
@@ -10,10 +10,12 @@ optionally your inventory - and answers with a complete, ordered list of actions
     BUY      place a buy offer: item, quantity, price
     HOLD     leave this order / this stack alone
 
-The engine never assumes an instruction was carried out. Fills, positions and profit
-come only from what the status reports. An instruction that has not shown up in the
-status yet is repeated unchanged (same order id, same price) for a few minutes and then
-re-planned, so the list stays stable while you are still typing offers in.
+The engine never assumes an instruction was carried out. Fills, positions, profit and
+the coin count come only from what the status reports (coins are stated once, then
+counted from the reported fills and offers; stating them again corrects the count). An
+instruction that has not shown up in the status yet is repeated unchanged (same order
+id, same price) for a few minutes and then re-planned, so the list stays stable while
+you are still typing offers in.
 
 It plans within the real constraints: GE slots (buy and sell offers share them),
 inventory stacks (one per item type - collect as notes), cash, 4-hour buy limits.
