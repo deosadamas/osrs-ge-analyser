@@ -153,6 +153,41 @@ says otherwise, add `"cash": <your coins>` to the status once.
 The file may be UTF-8 or UTF-16 (PowerShell). If it cannot be understood, `orders.json`
 carries an `error` saying what to fix and no actions.
 
+### Or let RuneLite write it
+
+With the [plugin](runelite-plugin/README.md) loaded you never touch `status.json`: it
+rewrites the file from the client every time an offer, your coins or your inventory
+changes (and once a minute otherwise). It reads; it never clicks.
+
+```sh
+ge-analyser execute        # leave it running next to RuneLite; no --init needed
+```
+
+Then the whole job is: do what the terminal says, top to bottom.
+
+- **Coins are exact.** `cash` is what is in your inventory (platinum tokens count as
+  1,000 each), read every time, so nothing has to be corrected. Coins still sitting in
+  an offer are not counted until you collect them.
+- **`COLLECT` stays until it is done.** The plugin sees a finished offer sitting in its
+  slot, so the instruction is repeated until the slot is empty, and nothing is booked
+  twice. A finished offer of your own is pointed out the same way.
+- **No order ids.** The game does not know the engine's ids, so the plugin names every
+  offer itself (`ref`) and says when it saw it placed (`since`). An offer is taken as an
+  instruction's when it was placed after the instruction was given, or is running with
+  exactly the instructed price and size. A finished offer that was already sitting
+  there never counts as a new instruction's fill.
+- **Your own offers are left alone**, and the engine does not buy an item you already
+  have an offer in.
+- **One account per session.** A status for another account is refused; give that
+  account its own folder (plugin setting *Status file*, `--dir`).
+- `inventory_capacity` is not something the client knows: set it with
+  `--inventory-slots` (default 26). Members worlds and your 8 or 3 slots are read off
+  the client.
+
+Extra fields the plugin writes: `source: "runelite"`, `account`, and per offer `slot`,
+`ref`, `since`, `spent` and — for a finished offer kept listed for 10 minutes after you
+collected it, so its final count cannot be missed — `collected: true`.
+
 ### How it behaves
 
 - **Only your status moves the books.** Nothing is assumed bought or sold until you

@@ -1,31 +1,81 @@
 # GE Analyser RuneLite plugin
 
-A side panel that shows the flips suggested by the `ge-analyser` CLI while you play,
-and a recorder that logs your real GE offers for `ge-analyser sync`.
+Three things next to the game:
 
-It only **reads** game state (`GrandExchangeOfferChanged`) and **draws** a panel. It never
-places, changes or cancels offers — that line is what separates a tool from a bot under
-Jagex's rules, and this plugin stays on the right side of it.
+- a side panel with the flips suggested by the `ge-analyser` CLI;
+- a recorder that logs your real GE offers for `ge-analyser sync`;
+- a **live status file** for `ge-analyser execute`: your GE offers, coins and inventory,
+  rewritten whenever one of them changes, so the execution loop needs no typing.
 
-## What you see
+It only **reads** game state and **writes files / draws a panel**. It never places,
+changes or cancels offers — that line is what separates a tool from a bot under Jagex's
+rules, and this plugin stays on the right side of it.
+
+## Live status for `ge-analyser execute`
+
+```sh
+ge-analyser execute        # in a terminal next to RuneLite; answers within ~2 s of every change
+```
+
+While you are logged in the plugin keeps `~/.osrs-ge-analyser/exec/status.json` (or the
+folder in `GE_ANALYSER_EXEC`, or the *Status file* setting) describing what the client
+shows:
+
+```json
+{
+  "source": "runelite",
+  "account": "Zezima",
+  "cash": 4950,
+  "members": true,
+  "slots": 8,
+  "orders": [
+    {"slot": 0, "ref": "0-1794371900", "since": 1794371900, "status": "BUYING",
+     "item_id": 440, "item": "Iron ore", "price": 44, "qty": 387, "filled": 120, "spent": 5280},
+    {"slot": 2, "ref": "2-1794371200", "since": 1794371200, "status": "SOLD",
+     "item_id": 554, "item": "Fire rune", "price": 5, "qty": 900, "filled": 900, "spent": 4500, "collected": true}
+  ],
+  "inventory": [{"item_id": 554, "item": "Fire rune", "qty": 120}]
+}
+```
+
+| field | meaning |
+|---|---|
+| `cash` | coins in your inventory, plus 1,000 per platinum token (the GE takes both since 30 Sep 2026) |
+| `members` | you are on a members world (which items can be traded) |
+| `slots` | 8 for a member, 3 otherwise |
+| `orders[].status` | the client's state: `BUYING`, `BOUGHT`, `CANCELLED_BUY`, `SELLING`, `SOLD`, `CANCELLED_SELL` |
+| `orders[].qty`, `.filled`, `.spent` | size of the offer, units traded, coins paid / received before tax |
+| `orders[].ref` | the plugin's own name for this offer; it keeps it until the offer leaves its slot, across client restarts |
+| `orders[].since` | when the plugin saw the offer being placed; `0` = it was already there when it first looked |
+| `orders[].collected` | a finished offer you have collected; it stays listed for 10 minutes so its final count cannot be missed |
+| `inventory` | every stack except coins; noted and un-noted forms count as the item itself |
+
+When it writes: one game tick after an offer, your coins or your inventory changed, and
+once a minute otherwise so the file's age shows it is being kept. Nothing is written
+while logged out, nor for the first few ticks after logging in or hopping: the client
+empties every GE slot then and the server sends them again, and that must not read as
+"everything was collected".
+
+The file is replaced in one step, so the CLI never reads half of it. Turn it off with
+the *Write status.json* setting.
+
+How it was checked: the status writer's own output was fed to the engine over 48 hours
+of real market history with a paper account behind it — every offer placed, filled,
+aborted and collected. The books came out identical to the coin to the same run with
+order ids, also across client restarts, and stayed right with a player who collects
+late. It has not yet been watched through a real logged-in session.
+
+## The panel
 
 Each row: item, `buy X → sell Y  +margin/ea`, then `qty · limit left/limit · fill % · exp`.
 Items whose 4-hour buy limit you have exhausted are shown in red. The header shows the
 budget the advice was computed for and how old it is (red when > 10 min).
 
-## Run it
-
-Two processes:
-
 ```sh
-# 1a. generic suggestions, refreshed every 60 s
+# generic suggestions, refreshed every 60 s
 ge-analyser advise --budget 10m --top 15
-# 1b. ...or mirror the live paper-trading agent: exactly the offers it has open right now
+# ...or mirror the paper-trading agent: exactly the offers it has open right now
 ge-analyser advise --from-agent
-
-# 2. RuneLite with the plugin (sideloaded; no Plugin Hub review needed for personal use)
-cd runelite-plugin
-./gradlew test --tests GeAnalyserPluginTest     # dev launcher, or run that class from an IDE
 ```
 
 In `--from-agent` mode each row is an order to have in the GE: `BUY Gold ore — 24,182 × 111 gp
@@ -35,28 +85,28 @@ realised P&L. Anything you have open that is not on the list is something the ag
 cancelled. For a machine-readable stream of the agent's decisions run it with
 `simulate --ticks 0 --events ~/.osrs-ge-analyser/agent-events.jsonl`: one JSON line per
 `offer` / `fill` / `cancel` / `reprice` / `dump` with item, qty, price and side.
-# 2. RuneLite with the plugin (sideloaded; no Plugin Hub review needed for personal use)
-cd runelite-plugin
-./gradlew test --tests GeAnalyserPluginTest     # dev launcher, or run that class from an IDE
-```
 
 The advice file lives at `~/.osrs-ge-analyser/advice.json` (configurable in the plugin
 settings). Your offers are appended to `~/.osrs-ge-analyser/runelite-trades.jsonl`, which
 `ge-analyser sync` reads automatically — Flipping Utilities is no longer required.
 
-## Build
+## Build and run
 
 ```sh
 cd runelite-plugin
-./gradlew jar          # build/libs/ge-analyser-0.1.0.jar
+./gradlew run                                  # RuneLite in developer mode with this plugin built in
+./gradlew shadowJar                            # build/libs/ge-analyser-0.1.0-all.jar: the same client as one runnable jar
+./gradlew test --tests StatusWriterTest        # the status writer's rules
 ```
 
-Needs JDK 11+ to compile (the build targets Java 11 bytecode) and network access for
-`net.runelite:client:latest.release` from `repo.runelite.net`. If you keep several JDKs,
-set `JAVA_HOME` to one of them; the toolchain block in `build.gradle` names 17.
+The plugin is not on the Plugin Hub, and the official launcher does not pass
+`--developer-mode`, so it cannot be dropped into a launcher-started client: it runs in
+the client `gradlew run` starts (your profile and Plugin Hub plugins load as usual), or
+from the jar: `java -ea -jar build/libs/ge-analyser-0.1.0-all.jar --developer-mode`.
 
-To load the built jar into a normal RuneLite install instead of the dev launcher,
-enable developer mode (`--developer-mode`) and drop the jar in `~/.runelite/sideloaded-plugins/`.
+Needs JDK 11–21 (the build targets Java 11 bytecode; set `JAVA_HOME` if your default JDK
+is newer) and network access for `net.runelite:client:latest.release` from
+`repo.runelite.net`.
 
 ## Trade log format
 

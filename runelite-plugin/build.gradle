@@ -36,3 +36,41 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release.set(11)
 }
+
+// The official launcher does not pass --developer-mode, so a plugin that is not on the
+// Plugin Hub runs in a client started from here: `gradlew run`, or the runnable jar.
+def pluginMainClass = 'com.geanalyser.GeAnalyserPluginTest'
+
+tasks.register('run', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = pluginMainClass
+
+    jvmArgs '-ea'
+    args '--developer-mode'
+}
+
+tasks.register('shadowJar', Jar) {
+    dependsOn configurations.testRuntimeClasspath
+    manifest {
+        attributes('Main-Class': pluginMainClass, 'Multi-Release': true)
+    }
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from sourceSets.main.output
+    from sourceSets.test.output
+    from {
+        configurations.testRuntimeClasspath.collect { file ->
+            file.isDirectory() ? file : zipTree(file)
+        }
+    }
+
+    exclude 'META-INF/INDEX.LIST'
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+    exclude '**/module-info.class'
+    exclude 'com/geanalyser/StatusWriterTest*'
+
+    group = BasePlugin.BUILD_GROUP
+    archiveFileName.set("${rootProject.name}-${project.version}-all.jar")
+}

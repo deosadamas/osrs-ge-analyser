@@ -252,6 +252,24 @@ def test_sell_is_repriced_then_dumped():
     assert dump["profit_each"] < 0  # cutting a loser is a loss, and is reported as one
 
 
+def test_relist_is_dropped_when_the_old_offer_sold_before_it_was_aborted():
+    eng = engine(sell_reprice=1800)
+    (buy,) = acts(eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+    t = T0 + 60
+    (sell,) = acts(eng.step(status(1, [{"order_id": buy["order_id"], "status": "bought"}], t, slots=1), market(ORE_ONLY, t), t), "SELL")
+    listed = t + 60
+    working = [{"order_id": sell["order_id"], "status": "open"}]
+    eng.step(status(1, working, listed, slots=1), market(ORE_ONLY, listed), listed)
+    t = listed + 1800
+    plan = eng.step(status(1, working, t, slots=1), market({ORE: (99, 105)}, t), t)
+    assert [a["action"] for a in plan.actions] == ["CANCEL", "SELL"]
+
+    t += 60  # ...but it sold at the old price before you got to it
+    plan = eng.step(status(1, [{"order_id": sell["order_id"], "status": "sold"}], t, slots=1), market({ORE: (99, 105)}, t), t)
+    assert not eng.state.positions and [o.side for o in eng.state.orders] == ["buy"]  # the relist instruction is gone with the stock
+    assert [a["action"] for a in plan.actions] == ["COLLECT", "BUY"]  # and the item is free to trade again
+
+
 def test_partial_fills_are_listed_only_once_they_matter():
     eng = engine(partial_sell_frac=0.2)
     (buy,) = acts(eng.step(status(10_000, slots=2), market(ORE_ONLY, T0), T0), "BUY")
@@ -354,6 +372,128 @@ def test_no_buy_without_a_chance_of_filling():
     never = ItemStats(windows=500, fill_buy=0.0, fill_sell=0.5, median_margin=3, volatility_pct=0.5, typical_volume=10_000)
     plan = engine().step(status(10_000), market(ORE_ONLY, T0, stats={ORE: never}), T0)
     assert not plan.actions and plan.account["ge_slots_used"] == 0
+
+
+# ---- statuses written by the RuneLite plugin: no order ids, offers named by `ref` ------
+
+
+def rl(slot, ref, state, price, qty, filled=0, since=0, spent=None, collected=False, item=ORE):
+    """One GE slot as the plugin describes it."""
+    out = {"slot": slot, "ref": ref, "since": since, "status": state, "item_id": item, "price": price, "qty": qty, "filled": filled,
+           "spent": price * filled if spent is None else spent}
+    return {**out, "collected": True} if collected else out
+
+
+def live(cash, offers=(), now=T0, inventory=(), slots=1):
+    raw = {"source": "runelite", "cash": cash, "members": True, "slots": slots, "orders": list(offers), "inventory": list(inventory)}
+    return parse_status(raw, ITEMS, now)
+
+
+def test_plugin_status_is_read_with_refs_and_exact_coins():
+    s = live(5, [rl(2, "2-9", "CANCELLED_SELL", 46, 20, filled=5, since=77, collected=True)])
+    (r,) = s.orders
+    assert s.live and (r.side, r.status, r.ref, r.since, r.slot, r.collected) == ("sell", "cancelled", "2-9", 77, 2, True)
+    assert not status(5).live
+
+
+def test_a_status_for_another_account_is_refused_and_changes_nothing():
+    eng = engine()
+    eng.step(status(10_000, account="Zezima"), market(ORE_ONLY, T0), T0)
+    with pytest.raises(StatusError, match="session belongs to 'Zezima'"):
+        eng.step(status(5, account="Someone else"), market(ORE_ONLY, T0 + 60), T0 + 60)
+    assert eng.state.seq == 1 and eng.state.orders[0].state == "pending"
+    eng.step(status(10_000), market(ORE_ONLY, T0 + 120), T0 + 120)  # a status that names nobody is the session's own
+    assert eng.state.seq == 2
+
+
+def test_a_whole_flip_from_plugin_statuses_without_order_ids():
+    eng = engine()
+    (buy,) = acts(eng.step(live(10_000), market(ORE_ONLY, T0), T0), "BUY")
+    assert (buy["qty"], buy["price"]) == (99, 101)
+    t = T0
+
+    def step(cash, offers, inventory=()):
+        nonlocal t
+        t += 60
+        return eng.step(live(cash, offers, t, inventory), market(ORE_ONLY, t), t)
+
+    # The offer appears in slot 0 after the instruction was given: it is that instruction.
+    plan = step(1, [rl(0, "0-a", "BUYING", 101, 99, since=T0 + 30)])
+    assert [a["action"] for a in plan.actions] == ["HOLD"] and eng.state.orders[0].ref == "0-a"
+    # 40 bought a coin under the bid: `spent` gives the real cost.
+    step(1, [rl(0, "0-a", "BUYING", 101, 99, filled=40, spent=4_000, since=T0 + 30)])
+    assert (eng.state.positions[ORE].qty, eng.state.positions[ORE].cost) == (40, 100.0)
+    done = rl(0, "0-a", "BOUGHT", 101, 99, filled=99, spent=9_959, since=T0 + 30)
+    plan = step(1, [done])
+    (sell,) = acts(plan, "SELL")
+    assert [a["action"] for a in plan.actions] == ["COLLECT", "SELL"] and (sell["qty"], sell["price"]) == (99, 109)
+    # Still sitting in its slot a minute later: nothing is booked twice, the COLLECT is repeated.
+    plan = step(1, [done])
+    assert [(a["action"], a["order_id"]) for a in plan.actions] == [("COLLECT", buy["order_id"]), ("SELL", sell["order_id"])]
+    assert eng.state.positions[ORE].qty == 99
+    # Collected (the plugin keeps the finished offer listed as `collected`) and the sell placed in the freed slot.
+    kept = {**done, "collected": True}
+    plan = step(41, [rl(0, "0-b", "SELLING", 109, 99, since=t + 50), kept])
+    assert [a["action"] for a in plan.actions] == ["HOLD"] and eng.state.orders[0].ref == "0-b"
+    sold = rl(0, "0-b", "SOLD", 109, 99, filled=99, since=t - 10)
+    plan = step(41, [sold, kept])
+    assert [a["action"] for a in plan.actions] == ["COLLECT"]  # the coins are still in the offer: nothing to buy with yet
+    assert eng.state.realised == 99 * 107 - 9_959 and not eng.state.positions
+    assert (plan.account["cash"], plan.account["cash_correction"]) == (41, 0)  # the inventory's coins, taken as they are
+    plan = step(41 + 99 * 107, [{**sold, "collected": True}, kept])
+    assert [a["action"] for a in plan.actions] == ["BUY"] and plan.account["cash"] == 10_634
+
+
+def test_a_finished_offer_left_in_its_slot_never_becomes_a_new_instructions_fill():
+    for since in (0, T0 - 100):  # nobody saw it placed / it was placed before the instruction
+        eng = engine()
+        stale = rl(0, "0-old", "BOUGHT", 101, 50, filled=50, since=since)
+        plan = eng.step(live(10_000, [stale], slots=2), market(ORE_ONLY, T0), T0)
+        (buy,) = acts(plan, "BUY")
+        assert (buy["qty"], buy["price"]) == (50, 101)  # the very same offer is asked for again
+        assert acts(plan, "COLLECT")[0]["why"].startswith("a finished offer this engine did not place")
+        t = T0 + 60
+        plan = eng.step(live(10_000, [stale], t, slots=2), market(ORE_ONLY, t), t)
+        assert not eng.state.positions and not plan.fills and eng.state.orders[0].state == "pending"
+        assert [a["action"] for a in plan.actions] == ["COLLECT", "BUY"]
+        # Collected, and the instruction carried out: now there is an offer to follow.
+        t += 60
+        eng.step(live(10_000 - 50 * 101, [rl(0, "0-new", "BUYING", 101, 50, since=t - 20)], t, slots=2), market(ORE_ONLY, t), t)
+        assert eng.state.orders[0].state == "working" and eng.state.orders[0].ref == "0-new"
+
+
+def test_offers_you_placed_yourself_are_left_alone_and_their_items_avoided():
+    eng = engine()
+    mine = rl(3, "3-x", "BUYING", 90, 10)
+    plan = eng.step(live(10_000, [mine], slots=8), market(BOTH, T0), T0)
+    assert [a["item"] for a in acts(plan, "BUY")] == ["Salmon"]  # not a second Iron ore offer on top of yours
+    assert acts(plan, "HOLD")[0]["why"].startswith("not placed by this engine") and plan.account["ge_slots_used"] == 2
+
+
+def test_a_running_offer_with_exactly_the_instructed_price_and_size_is_adopted():
+    for qty, adopted in ((99, True), (50, False)):
+        eng = engine()
+        eng.step(live(10_000), market(ORE_ONLY, T0), T0)  # asks for 99 @ 101
+        t = T0 + 60
+        plan = eng.step(live(1, [rl(0, "0-u", "BUYING", 101, qty)], t), market(ORE_ONLY, t), t)  # since unknown
+        # Another size, placed nobody knows when: yours, not the engine's. It fills the only slot, so the instruction is dropped.
+        assert [o.state for o in eng.state.orders] == (["working"] if adopted else [])
+        assert plan.actions[0]["why"].startswith("not placed by this engine") is not adopted
+
+
+def test_an_instruction_withdrawn_a_moment_ago_and_placed_after_all_is_taken_back():
+    eng = engine(pending_ttl=180)
+    (first,) = acts(eng.step(live(10_000), market(ORE_ONLY, T0), T0), "BUY")
+    moved = {ORE: (101, 111)}
+    t = T0 + 200
+    (second,) = acts(eng.step(live(10_000, [], t), market(moved, t), t), "BUY")
+    assert second["order_id"] != first["order_id"] and second["price"] == 102  # re-planned at the new price
+    # ...but you had typed in the first one in the meantime.
+    t += 60
+    plan = eng.step(live(1, [rl(0, "0-late", "BUYING", 101, 99, since=T0 + 150)], t), market(moved, t), t)
+    (o,) = eng.state.orders
+    assert (o.id, o.state, o.ref) == (first["order_id"], "working", "0-late")
+    assert [a["action"] for a in plan.actions] == ["HOLD"]
 
 
 def test_missing_order_is_asked_about_then_assumed_cancelled():

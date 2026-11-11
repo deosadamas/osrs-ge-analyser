@@ -36,6 +36,8 @@ COIN_NAMES = frozenset({"coins", "platinum token", "platinum tokens"})
 SIGNAL_MAX_AGE = 900  # a market print older than this never cancels a buy on "margin gone"
 MAX_DONE = 1000  # finished orders kept for the report and the fill calibration
 MAX_WITHDRAWN = 40  # never-placed instructions kept so a late placement is still recognised
+ADOPT_SLACK = 5  # s: an offer seen this long before its instruction's timestamp still answers it (clock granularity)
+ADOPT_WITHDRAWN = 900  # s: an instruction withdrawn this recently is taken back if exactly that offer shows up
 
 _STATUS = {
     "open": "open", "pending": "open", "placed": "open", "new": "open", "waiting": "open", "active": "open",
@@ -68,6 +70,9 @@ class OrderReport:
     qty: int | None = None
     spent: int | None = None  # coins paid / received (before tax) for the filled units so far
     slot: int | None = None
+    ref: str | None = None  # a stable name for this offer when there is no order id (the RuneLite plugin's)
+    since: int | None = None  # when the reporter saw the offer being placed; 0/None = it does not know
+    collected: bool = False  # finished and already taken out of its slot: no COLLECT needed
 
 
 @dataclass
@@ -79,6 +84,8 @@ class Status:
     slots: int | None = None
     inventory_capacity: int | None = None
     members: bool | None = None
+    live: bool = False  # read off the game client: coins are exact, finished offers stay listed until collected
+    account: str | None = None  # the name the status was written for, when it says
 
 
 def _key(text: Any) -> str:
@@ -157,6 +164,8 @@ def parse_status(raw: Any, items: dict[int, ItemInfo], ts: int) -> Status:
         qty = _first(e, "qty", "quantity", "total")
         spent = _first(e, "spent", "coins")
         slot = e.get("slot")
+        ref = e.get("ref")
+        since = e.get("since")
         r = OrderReport(
             order_id=_int(oid, f"orders[{n}].order_id") if oid is not None else None,
             side=side,
@@ -167,6 +176,9 @@ def parse_status(raw: Any, items: dict[int, ItemInfo], ts: int) -> Status:
             qty=_int(qty, f"orders[{n}].qty") if qty is not None else None,
             spent=_int(spent, f"orders[{n}].spent") if spent is not None else None,
             slot=_int(slot, f"orders[{n}].slot") if slot is not None else None,
+            ref=str(ref) if ref is not None else None,
+            since=_int(since, f"orders[{n}].since") if since is not None else None,
+            collected=e.get("collected") is True,
         )
         if r.order_id is None and (r.side is None or r.item_id is None):
             raise StatusError(f"orders[{n}] needs an order_id, or an item plus side (buy/sell)")
@@ -210,6 +222,8 @@ def parse_status(raw: Any, items: dict[int, ItemInfo], ts: int) -> Status:
         slots=_int(slots, "slots") if slots is not None else None,
         inventory_capacity=_int(cap, "inventory_capacity") if cap is not None else None,
         members=members,
+        live=_key(raw.get("source") or "") == "runelite",
+        account=str(raw["account"]) if raw.get("account") else None,
     )
 
 
@@ -237,6 +251,7 @@ class ExecOrder:
     closed: int = 0
     outcome: str = ""  # executed | cancelled | withdrawn
     slot: int | None = None
+    ref: str | None = None  # the name a status reader (the RuneLite plugin) gives the offer in the GE
     model_fill: float | None = None  # what the paper fill model gives for this order (calibration)
 
     @property
@@ -288,6 +303,7 @@ class ExecState:
     members: bool | None = None
     slots: int | None = None
     inventory_capacity: int | None = None
+    account: str | None = None  # whose session this is, once a status has said
 
     def locked(self) -> int:
         """Coins sitting in buy offers the status has confirmed."""
@@ -507,10 +523,12 @@ class Executor:
         if r.status == "executed" or o.filled >= o.qty:
             verb = "bought" if o.side == "buy" else "sold"
             self._close(o, "executed", now)
-            collect.append(self._line("COLLECT", o, f"executed: {o.filled:,}/{o.qty:,} {verb}; collect to free the slot"))
+            if not r.collected:
+                collect.append(self._line("COLLECT", o, f"executed: {o.filled:,}/{o.qty:,} {verb}; collect to free the slot"))
         elif r.status == "cancelled":
             self._close(o, "cancelled", now)
-            collect.append(self._line("COLLECT", o, f"cancelled at {o.filled:,}/{o.qty:,}; collect to free the slot"))
+            if not r.collected:
+                collect.append(self._line("COLLECT", o, f"cancelled at {o.filled:,}/{o.qty:,}; collect to free the slot"))
 
     def _resolve_by_inventory(self, o: ExecOrder, status: Status, now: int, fills: list[Fill]) -> bool:
         """An order left the GE without a final report: read its fate off the inventory."""
@@ -533,8 +551,37 @@ class Executor:
         self._close(o, "executed" if o.filled >= o.qty else "cancelled", now)
         return True
 
-    def _reconcile(self, status: Status, now: int, fills: list[Fill], collect: list[dict], hold: list[dict], warnings: list[str]) -> int:
-        """Apply the status to the book. Returns GE slots held by offers we do not manage."""
+    def _adopt(self, r: OrderReport, now: int, refs_present: set[str]) -> ExecOrder | None:
+        """The instruction behind an offer that is reported by `ref` instead of an order id.
+        Only an offer that can be that instruction is taken: one placed after it was given,
+        or a running one with exactly its price and quantity. A finished offer that was
+        already sitting in its slot never becomes a new instruction's fill."""
+        st = self.state
+
+        def exact(o: ExecOrder) -> bool:
+            return r.price == o.price and r.qty == o.qty
+
+        running = r.status in ("open", "filling")
+        for o in st.orders:
+            if o.item_id != r.item_id or o.side != r.side or (o.ref and o.ref in refs_present):
+                continue
+            if o.state == "working":
+                # Confirmed earlier under another name (typed by hand, or the reporter lost its memory).
+                if exact(o) and (r.filled or 0) >= o.filled:
+                    return o
+            elif (r.since and r.since >= o.issued - ADOPT_SLACK) or (running and exact(o)):
+                return o
+        for o in reversed(st.done):  # withdrawn a moment ago and placed after all
+            if o.outcome == "withdrawn" and o.item_id == r.item_id and o.side == r.side and exact(o) and now - o.closed <= ADOPT_WITHDRAWN and (running or r.since):
+                st.done.remove(o)
+                o.state, o.outcome, o.closed = "pending", "", 0
+                st.orders.append(o)
+                return o
+        return None
+
+    def _reconcile(self, status: Status, now: int, fills: list[Fill], collect: list[dict], hold: list[dict], warnings: list[str]) -> tuple[int, set[int]]:
+        """Apply the status to the book. Returns the GE slots held by offers we do not
+        manage, and the items those offers are for."""
         st = self.state
         active = {o.id: o for o in st.orders}
         by_key: dict[tuple[str, int], ExecOrder] = {}
@@ -543,8 +590,12 @@ class Executor:
             if k not in by_key or (by_key[k].state != "working" and o.state == "working"):
                 by_key[k] = o
         done = {o.id: o for o in st.done}
+        by_ref = {o.ref: o for o in st.orders if o.ref}
+        closed_ref = {o.ref: o for o in st.done if o.ref}
+        refs_present = {r.ref for r in status.orders if r.ref}
         seen: set[int] = set()
         foreign = 0
+        foreign_items: set[int] = set()
         for r in status.orders:
             o = None
             if r.order_id is not None:
@@ -560,15 +611,31 @@ class Executor:
                 elif o is None:
                     warnings.append(f"status mentions order #{r.order_id}, which this engine never issued: ignored")
                     continue
+            elif r.ref is not None:
+                o = by_ref.get(r.ref)
+                if o is not None and (o.item_id != r.item_id or o.side != r.side):
+                    o = None  # the same name on a different offer: not ours
+                if o is None:
+                    old = closed_ref.get(r.ref)
+                    if old is not None and old.item_id == r.item_id and r.status in ("executed", "cancelled"):
+                        if not r.collected:  # booked already, but it still sits in its slot
+                            collect.append(self._line("COLLECT", old, "finished and still in its slot: collect to free it"))
+                        continue
+                    o = self._adopt(r, now, refs_present)
+                    if o is not None:
+                        o.ref = r.ref
+                        by_ref[r.ref] = o
             elif r.side and r.item_id is not None:
                 o = by_key.get((r.side, r.item_id))
             if o is None:
+                label = self._name(r.item_id) if r.item_id is not None else "?"
                 if r.status in ("open", "filling"):
                     foreign += 1
-                    hold.append({
-                        "action": "HOLD", "item": self._name(r.item_id) if r.item_id is not None else "?", "item_id": r.item_id,
-                        "side": r.side, "why": "not placed by this engine: left alone (it uses a GE slot)",
-                    })
+                    if r.item_id is not None:
+                        foreign_items.add(r.item_id)
+                    hold.append({"action": "HOLD", "item": label, "item_id": r.item_id, "side": r.side, "why": "not placed by this engine: left alone (it uses a GE slot)"})
+                elif r.ref is not None and not r.collected:
+                    collect.append({"action": "COLLECT", "item": label, "item_id": r.item_id, "side": r.side, "slot": r.slot, "why": "a finished offer this engine did not place: collect it to free the slot"})
                 continue
             if o.id in seen:
                 continue
@@ -591,7 +658,7 @@ class Executor:
             else:
                 foreign += 1
                 hold.append(self._line("HOLD", o, "missing from your status: report it once more as executed or cancelled (with filled)", needs_status=True))
-        return foreign
+        return foreign, foreign_items
 
     # -- decisions on orders already in the GE --------------------------------
     def _review(self, o: ExecOrder, lp: LatestPrice | None, now: int) -> tuple[str, str]:
@@ -625,6 +692,10 @@ class Executor:
     # -- new sell offers for stock we hold ------------------------------------
     def _plan_sells(self, market: Market, now: int, free: int, sell: list[dict], hold: list[dict]) -> int:
         st, cfg = self.state, self.cfg
+        # The stock a sell instruction was for can be gone before it is placed (the offer
+        # it was to replace sold after all): nothing is left to list, and the item is free again.
+        for o in [o for o in st.orders if o.side == "sell" and o.state == "pending" and o.item_id not in st.positions]:
+            self._close(o, "withdrawn", now)
         for item_id, pos in sorted(st.positions.items(), key=lambda kv: -kv[1].qty * kv[1].cost):
             mine = [o for o in st.orders if o.item_id == item_id]
             # A sell that is missing from the status is still treated as listed until its fate is known.
@@ -668,7 +739,9 @@ class Executor:
         return free
 
     # -- new buy offers ---------------------------------------------------------
-    def _plan_buys(self, market: Market, now: int, free: int, cash: int, held: set[int], capacity: int, members: bool | None, buy: list[dict], equity: int) -> None:
+    def _plan_buys(
+        self, market: Market, now: int, free: int, cash: int, held: set[int], capacity: int, members: bool | None, buy: list[dict], equity: int, avoid: set[int]
+    ) -> None:
         st, cfg = self.state, self.cfg
         working = {o.item_id for o in st.orders if o.state == "working"}
         for o in [o for o in st.orders if o.side == "buy" and o.state == "pending"]:
@@ -697,7 +770,7 @@ class Executor:
         if free <= 0 or cash < floor:
             return
         spread = min(free, cash // floor)
-        busy = set(st.positions) | {o.item_id for o in st.orders}
+        busy = set(st.positions) | {o.item_id for o in st.orders} | avoid
         base = cfg.volume_frac if cfg.volume_frac is not None else (cfg.buy_timeout / 3600) / cfg.fill_share
         scale, default = market.volume_scale, market.default_scale
         frac = (lambda i: base * scale.get(i, default)) if (scale or default != 1.0) else base
@@ -753,6 +826,10 @@ class Executor:
         st, cfg = self.state, self.cfg
         if status.cash is None and st.cash_anchor is None:
             raise StatusError('the first status needs "cash": the coins in your inventory')
+        if status.account and st.account and status.account != st.account:
+            # Another account's offers would read as this one's having all vanished.
+            raise StatusError(f"this status is for {status.account!r}, the session belongs to {st.account!r}: give that account its own --dir, or start over with --init --reset")
+        st.account = status.account or st.account
         st.seq += 1
         collect: list[dict] = []
         cancel: list[dict] = []
@@ -775,15 +852,15 @@ class Executor:
         slots_total = st.slots or (min(cfg.slots, 3) if st.members is False else cfg.slots)
         capacity = st.inventory_capacity or cfg.inventory_slots
 
-        occupied = self._reconcile(status, now, fills, collect, hold, warnings)
+        occupied, foreign_items = self._reconcile(status, now, fills, collect, hold, warnings)
 
         # Coins are counted from the book: what you started with, plus every sale and minus
         # every purchase you reported, minus what is locked in buy offers. A "cash" figure is
         # a correction only when you change it - the same number again says nothing new.
         reserved = st.locked()
         correction = 0
-        if status.cash is not None and (st.cash_anchor is None or status.cash != st.cash_given):
-            if st.cash_anchor is not None:
+        if status.cash is not None and (status.live or st.cash_anchor is None or status.cash != st.cash_given):
+            if st.cash_anchor is not None and not status.live:
                 correction = status.cash - (st.cash_anchor + st.flow - reserved)
             st.cash_anchor = status.cash - st.flow + reserved
             st.cash_given = status.cash
@@ -822,7 +899,7 @@ class Executor:
             st.start_ts, st.start_equity = now, equity
 
         free = self._plan_sells(market, now, free, sell, hold)
-        self._plan_buys(market, now, free, cash, held, capacity, members, buy, equity)
+        self._plan_buys(market, now, free, cash, held, capacity, members, buy, equity, foreign_items)
 
         actions = [{"step": n, **a} for n, a in enumerate(collect + cancel + sell + buy + hold, 1)]
         account = {

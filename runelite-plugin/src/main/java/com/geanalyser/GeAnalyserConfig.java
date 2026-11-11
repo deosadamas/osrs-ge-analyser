@@ -53,4 +53,26 @@ public interface GeAnalyserConfig extends Config
 	{
 		return 15;
 	}
+
+	@ConfigItem(
+		keyName = "writeStatus",
+		name = "Write status.json",
+		description = "Keep status.json for `ge-analyser execute` up to date with your GE offers, coins and inventory. Read-only: nothing in the game is touched",
+		position = 4
+	)
+	default boolean writeStatus()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "statusFile",
+		name = "Status file",
+		description = "Where to write it. Empty = ~/.osrs-ge-analyser/exec/status.json (or the folder in GE_ANALYSER_EXEC)",
+		position = 5
+	)
+	default String statusFile()
+	{
+		return "";
+	}
 }
