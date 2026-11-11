@@ -119,6 +119,9 @@ def test_stats_change_ranking_and_unknown_items_sink():
     assert legacy[0] in ("Spiky", "Ghost")
     assert informed[0] == "Steady"
     ghost = next(f for f in find_flips(items, latest, hour, 10_000, now, min_volume=0, stats=stats) if f.item.id == 3)
-    assert ghost.stats is UNKNOWN_STATS and ghost.expected_profit == int(ghost.profit * 0.01)
+    # No track record: at most 10% of the price is trusted as margin, however wide the quote (100 -> 200).
+    assert ghost.stats is UNKNOWN_STATS and ghost.expected_profit == int(10 * ghost.quantity * 0.01)
+    # ...and an engine that requires history never sees it at all.
+    assert 3 not in {f.item.id for f in find_flips(items, latest, hour, 10_000, now, min_volume=0, stats=stats, require_history=True)}
     steady = evaluate_flip(items[2], latest[2], hour[2], 10_000, now, stats=stats[2])
     assert steady.expected_profit == int(min(steady.margin, 10) * steady.quantity * 0.64)

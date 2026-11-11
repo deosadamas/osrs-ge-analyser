@@ -4,6 +4,7 @@
     ge-analyser item "Abyssal whip"
     ge-analyser dips --budget 10m --top 15
     ge-analyser simulate --budget 10k --backtest 24
+    ge-analyser execute --init --cash 250k && ge-analyser execute
 """
 
 from __future__ import annotations
@@ -14,11 +15,13 @@ import os
 import statistics
 import sys
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
-from datetime import datetime, timezone
 
 from .analysis import (
+    MARGIN_CAP,
     Flip,
     ItemStats,
     find_flips,
@@ -29,7 +32,9 @@ from .analysis import (
     trend_from_timeseries,
 )
 from .api import GEClient, ItemInfo
-from .calibrate import calibrate, fifo_pnl, fill_stats, lookback_for_age
+from .broker import run_backtest
+from .calibrate import FillReality, calibrate, fifo_pnl, fill_reality, fill_stats, lookback_for_age, model_fill, sizing_scales
+from .executor import ExecConfig, ExecState, Executor, Market, StatusError, parse_status
 from .features import TimedStats, bucket_label, bucket_of, cached_timed_stats, compute_timed_stats, crossings
 from .history import DEFAULT_DEPTH_DAYS, STEPS, HistoryStore
 from .ledger import Ledger, Purchase
@@ -429,21 +434,8 @@ def _run_backtest(
     end: int,
     stats_at: Callable[[int], dict[int, ItemStats]] | None,
 ) -> tuple[State, Snapshot, int]:
-    state = State(start_cash=budget, cash=budget)
-    sim = Simulator(state, items, cfg)
-    sim.stats_at = stats_at
-    history: list[Snapshot] = []
-    snap: Snapshot = {}
-    replayed = 0
-    for ts, bucket in store.windows(start - 3600, end + 1):
-        snap = snapshot_from_buckets(bucket, ts)
-        history.append(snap)
-        del history[:-12]
-        if ts < start:
-            continue  # warm-up: populates hourly volume before the first decision
-        sim.step(snap, latest_from_snapshot(snap), hour_from_history(history), ts)
-        replayed += 1
-    return state, snap, replayed
+    # One hour of warm-up windows populates hourly volume before the first decision.
+    return replay(store.windows(start - 3600, end + 1), items, cfg, budget, start, stats_at)
 
 
 def _backtest(args: argparse.Namespace, client: GEClient, items: dict[int, ItemInfo], cfg: Config) -> None:
@@ -866,6 +858,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--events", metavar="PATH", help="append one JSON line per decision (offer/fill/cancel/reprice/dump) to this file")
     s.set_defaults(func=cmd_simulate)
 
+    x = sub.add_parser("execute", help="execution loop: reads your order status from status.json, writes what to do next (BUY / SELL / HOLD / CANCEL / COLLECT) to orders.json")
+    agent_args(x)
+    x.set_defaults(min_volume=200)
+    x.add_argument("--dir", help="folder with status.json / orders.json / state.json (default ~/.osrs-ge-analyser/exec)")
+    x.add_argument("--init", action="store_true", help="start a session: write a first status.json")
+    x.add_argument("--cash", help="coins for --init, e.g. 250k (default: --budget)")
+    x.add_argument("--reset", action="store_true", help="with --init: discard the existing session")
+    x.add_argument("--once", action="store_true", help="answer the current status once and exit")
+    x.add_argument("--interval", type=int, default=60, help="seconds between answers when status.json has not changed (default 60)")
+    x.add_argument("--inventory-slots", type=int, default=26, help="item stacks you can hold; collect as notes so each item is one stack (default 26)")
+    x.add_argument("--max-status-age", type=int, default=300, help="warn when status.json is older than this many seconds (default 300)")
+    x.add_argument("--margin-cap", type=float, default=MARGIN_CAP, help="plan asks at most this multiple of an item's typical margin over cost; 0 = off (default 2)")
+    x.add_argument("--no-margin-cancel", action="store_true", help="keep a buy offer even when the market has moved so it would lose after tax")
+    x.add_argument("--volume-frac", type=float, default=None, help="size each order to this share of hourly volume (default: buy timeout / fill share = 0.05)")
+    x.add_argument("--backtest", type=float, metavar="HOURS", help="replay the last N hours through the same engine with a paper broker")
+    x.add_argument("--compare", action="store_true", help="backtest: show how the result depends on the share of volume you get, the inventory limit and the old simulator")
+    x.add_argument("--report", action="store_true", help="session so far: profit, orders, stock, real fills vs the model")
+    x.set_defaults(func=cmd_execute)
+
     h = sub.add_parser("history", help="backfill / top up the local market history (5m, 1h and daily, all items)")
     h.add_argument("--days-5m", type=float, default=DEFAULT_DEPTH_DAYS["5m"], help="5-minute windows to keep (default 30 days)")
     h.add_argument("--days-1h", type=float, default=DEFAULT_DEPTH_DAYS["1h"], help="hourly windows to keep (default 365 days)")
@@ -935,6 +946,286 @@ def cmd_tune(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
     else:
         print(f"\nRecommendation: {chosen.describe()} — best on the older folds and better than default on the newest one.")
         print("Apply by editing ScoreParams defaults in ge_analyser/analysis.py (and SHRINK_WINDOWS in features.py).")
+
+
+# ---- execution loop: you trade, the files talk -------------------------------
+
+HOW_TO_REPLY = (
+    "Do the actions top to bottom, then rewrite status.json: your coins, and for every order still in the GE "
+    "(or just finished) its order_id, status (open | filling | executed | cancelled) and filled. "
+    "reply_template is that file pre-filled; edit the numbers."
+)
+
+
+def _exec_dir(args: argparse.Namespace) -> Path:
+    if args.dir:
+        return Path(args.dir).expanduser()
+    override = os.environ.get("GE_ANALYSER_EXEC")
+    return Path(override) if override else Path.home() / ".osrs-ge-analyser" / "exec"
+
+
+def _exec_config(args: argparse.Namespace) -> ExecConfig:
+    members = _members_filter(args)
+    return ExecConfig(
+        slots=args.slots if args.slots is not None else (3 if members is False else 8),
+        inventory_slots=args.inventory_slots,
+        min_volume=args.min_volume,
+        max_age=args.max_age * 60,
+        members=members,
+        min_margin=args.min_margin,
+        min_roi=args.min_roi / 100,
+        improve=not args.no_improve,
+        fill_share=args.fill_share,
+        volume_frac=args.volume_frac,
+        cancel_on_margin=not args.no_margin_cancel,
+        margin_cap=args.margin_cap,
+    )
+
+
+def _read_json(path: Path):
+    """JSON written by hand or by PowerShell: tolerate a UTF-8 BOM and UTF-16."""
+    data = path.read_bytes()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return json.loads(data.decode("utf-16"))
+    return json.loads(data.decode("utf-8-sig"))
+
+
+def _write_json(path: Path, obj, indent: int | None = 2) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, indent=indent), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _print_plan(out: dict) -> None:
+    a = out["account"]
+    print(
+        f"--- {out['time'][11:]}  #{out['seq']}  cash {fmt_gp(a['cash'])}  equity ~{fmt_gp(a['equity_est'])}  realised {a['realised']:+,}  "
+        f"GE slots {a['ge_slots_used']}/{a['ge_slots']}  stacks {a['inventory_stacks']}/{a['inventory_capacity']}  ({a['items_allowed']}) ---"
+    )
+    rows = []
+    for x in out["actions"]:
+        rows.append([
+            str(x["step"]),
+            x["action"],
+            f"#{x['order_id']}" if x.get("order_id") else "",
+            str(x.get("item", "")),
+            f"{x['qty']:,}" if x.get("qty") is not None else "",
+            f"{x['price']:,}" if x.get("price") is not None else "",
+            x.get("why", ""),
+        ])
+    if rows:
+        print(_table(["#", "Do", "Order", "Item", "Qty", "Price", "Why"], rows, right={0, 4, 5}))
+    else:
+        print("Nothing to do: no order, no stock, no flip that passes the filters.")
+    for w in out["warnings"]:
+        print(f"  ! {w}")
+    sys.stdout.flush()
+
+
+def _exec_calibration(args: argparse.Namespace, state: ExecState, cfg: ExecConfig) -> FillReality | None:
+    """Compare finished real orders with what the paper fill model gives for the same
+    order over the same windows. Needs the local 5m history."""
+    if args.no_stats:
+        return None
+    store = HistoryStore()
+    _, last, _ = store.coverage()
+    if last is None:
+        return None
+    for o in state.done:
+        if o.model_fill is None and o.seen and o.outcome in ("executed", "cancelled") and o.closed <= last + 300:
+            rows = store.db.execute(
+                "SELECT ts, high, hvol, low, lvol FROM w5 WHERE item=? AND ts > ? AND ts < ? ORDER BY ts", (o.item_id, o.seen - 300, o.closed)
+            ).fetchall()
+            o.model_fill = model_fill(rows, o.side, o.price, o.qty, o.seen, o.closed, cfg.fill_share)
+    return fill_reality(state.done, side="buy")
+
+
+def _exec_cycle(args: argparse.Namespace, client: GEClient, ledger: Ledger, engine: Executor, items: dict[int, ItemInfo], d: Path) -> None:
+    now = int(time.time())
+    status_path, orders_path, state_path = d / "status.json", d / "orders.json", d / "state.json"
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+
+    def fail(message: str) -> None:
+        _write_json(orders_path, {"time": stamp, "ts": now, "error": message, "actions": []})
+        print(f"--- {stamp[11:]}  {message}", flush=True)
+
+    if not status_path.exists():
+        return fail(f"no {status_path}: run `ge-analyser execute --init --cash <coins>` or write the file yourself")
+    try:
+        status = parse_status(_read_json(status_path), items, int(status_path.stat().st_mtime))
+    except (json.JSONDecodeError, UnicodeDecodeError, StatusError) as e:
+        return fail(f"status.json not understood: {e}")
+    try:
+        latest, hour = client.latest(), client.hourly()
+        timed = _timed_stats(args, client, items, now)
+    except (OSError, ValueError, KeyError) as e:
+        print(f"--- {stamp[11:]}  market data fetch failed ({type(e).__name__}: {e}); orders.json left as it was", flush=True)
+        return
+    reality = _exec_calibration(args, engine.state, engine.cfg)
+    default_scale, item_scales = sizing_scales(reality) if reality else (1.0, {})
+    market = Market(latest=latest, hour=hour, stats=timed.at(now) if timed else None, used=ledger.used(now), volume_scale=item_scales, default_scale=default_scale)
+    plan = engine.step(status, market, now)
+    for f in plan.fills:
+        if f.side == "buy":
+            ledger.record(f.item_id, f.qty, now, source="exec")
+    engine.state.save(state_path)
+    out = plan.to_json()
+    out = {"time": stamp, **out}
+    if out["status_age_s"] > args.max_status_age:
+        out["warnings"].insert(0, f"status.json is {out['status_age_s'] // 60} min old: update it before acting on these orders")
+    out["calibration"] = {
+        "finished_buy_orders_measured": reality.orders if reality else 0,
+        "real_fill_vs_model": round(reality.ratio, 2) if reality and reality.ratio is not None else None,
+        "order_size_scale": round(default_scale, 2),
+    }
+    out["how_to_reply"] = HOW_TO_REPLY
+    _write_json(orders_path, out)
+    _print_plan(out)
+
+
+def _exec_report(d: Path) -> None:
+    state_path = d / "state.json"
+    if not state_path.exists():
+        sys.exit(f"No session in {d}. Start one with `ge-analyser execute --init --cash <coins>`.")
+    st = ExecState.load(state_path)
+    hours = (time.time() - st.start_ts) / 3600 if st.start_ts else 0
+    print(f"Session in {d}: {st.seq} cycles over {hours:.1f}h, started with ~{fmt_gp(st.start_equity)}")
+    print(f"Realised {st.realised:+,} gp after {fmt_gp(st.tax_paid)} tax; {st.sells} sell fills, {st.wins} profitable")
+    if st.orders:
+        print("\nOrders on the book:")
+        print(_table(
+            ["Order", "Side", "Item", "Qty", "Filled", "Price", "State"],
+            [[f"#{o.id}", o.side, o.name, f"{o.qty:,}", f"{o.filled:,}", f"{o.price:,}", "not placed yet" if o.state == "pending" else ("cancel asked" if o.cancel_requested else "in the GE")] for o in st.orders],
+            right={3, 4, 5},
+        ))
+    if st.positions:
+        print("\nStock held:")
+        print(_table(["Item", "Units", "Avg cost", "Stage"], [[p.name, f"{p.qty:,}", f"{p.cost:,.1f}", p.stage] for p in st.positions.values()], right={1, 2}))
+    closed = [o for o in st.done if o.seen and o.outcome in ("executed", "cancelled")]
+    buys = [o for o in closed if o.side == "buy"]
+    if buys:
+        full = sum(1 for o in buys if o.outcome == "executed")
+        some = sum(1 for o in buys if o.outcome == "cancelled" and o.filled)
+        print(f"\nBuy orders finished: {len(buys)} - {full} filled completely, {some} partly, {len(buys) - full - some} not at all")
+    reality = fill_reality(st.done, side="buy")
+    if reality.orders:
+        ratio = f"{reality.ratio:.2f}" if reality.ratio is not None else "n/a"
+        print(f"Real fills vs the paper model on {reality.orders} measured buy orders: {ratio} (1.00 = backtests are right; below = they overstate)")
+
+
+def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
+    items = client.mapping()
+    cfg = _exec_config(args)
+    cfg.max_age = 10 * 60  # history buckets are fresh relative to their own timestamp
+    budget = parse_gp(args.budget)
+    store = HistoryStore()
+    _top_up(store, client, args.backtest / 24 + args.history_days + 0.1)
+    _, last, _ = store.coverage()
+    if last is None:
+        sys.exit("No history available.")
+    end, start = last, last - int(args.backtest * 3600)
+    names = {i: it.name for i, it in items.items()}
+    # Features come only from windows before the replay starts: no look-ahead.
+    timed = None if args.no_stats else compute_timed_stats(store, names, start - int(args.history_days * 86400), start)
+    stats_at = timed.at if timed else None
+    windows = list(store.windows(start - 3600, end + 1))
+    span = f"{time.strftime('%m-%d %H:%M', time.localtime(start))} to {time.strftime('%m-%d %H:%M', time.localtime(end))}"
+    who = "free-to-play items" if cfg.members is False else "all items"
+    print(f"Execution backtest: {args.backtest:g}h ({span}), {who}, start {fmt_gp(budget)}, {cfg.slots} GE slots, {cfg.inventory_slots} inventory stacks")
+
+    def top_share(pnl: dict[str, int]) -> str:
+        gains = sum(v for v in pnl.values() if v > 0)
+        if not gains:
+            return "-"
+        name, best = max(pnl.items(), key=lambda kv: kv[1])
+        return f"{best / gains * 100:.0f}% {name}"
+
+    def row(label: str, r) -> list[str]:
+        st = r.state
+        return [
+            label, fmt_gp(r.equity), f"{r.ret * 100:+.0f}%", str(st.sells), f"{st.wins / st.sells * 100:.0f}%" if st.sells else "-",
+            f"{r.actions_per_hour:.0f}", str(r.broker.max_stacks), top_share(r.pnl_by_item),
+        ]
+
+    headers = ["Model", "Equity", "Return", "Sells", "Win", "Clicks/h", "Max stacks", "Biggest winner"]
+    if args.compare:
+        rows = []
+        for share in (10, 30, 100):
+            c = replace(cfg, fill_share=share)
+            rows.append(row(f"engine, you get 1/{share} of crossing volume", run_backtest(windows, items, c, budget, start, stats_at, fill_share=share, strict=not args.loose)))
+        c = replace(cfg, inventory_slots=10**6)
+        rows.append(row("engine, 1/10, unlimited inventory", run_backtest(windows, items, c, budget, start, stats_at, fill_share=10, strict=not args.loose)))
+        legacy = Config(slots=cfg.slots, min_volume=cfg.min_volume, max_age=cfg.max_age, members=cfg.members, strict=not args.loose, min_margin=cfg.min_margin, min_roi=cfg.min_roi, improve=cfg.improve)
+        state, snap, _ = replay(windows, items, legacy, budget, start, stats_at)
+        by: dict[str, int] = {}
+        for t in state.trades:
+            if t.kind == "sell":
+                by[t.name] = by.get(t.name, 0) + t.profit
+        sells = [t for t in state.trades if t.kind == "sell"]
+        eq = state.equity(snap)
+        rows.append(["legacy simulator, 1/10 (sells need no slot)", fmt_gp(eq), f"{(eq / budget - 1) * 100:+.0f}%", str(len(sells)), f"{sum(t.profit > 0 for t in sells) / len(sells) * 100:.0f}%" if sells else "-", "-", "-", top_share(by)])
+        print()
+        print(_table(headers, rows, right={1, 2, 3, 4, 5, 6}))
+        print("\nThe share of volume you really get is the unknown; `execute --report` measures it from your own fills.")
+        return
+
+    r = run_backtest(windows, items, cfg, budget, start, stats_at, fill_share=cfg.fill_share, strict=not args.loose)
+    print()
+    print(_table(headers, [row(f"engine, 1/{cfg.fill_share} of crossing volume", r)], right={1, 2, 3, 4, 5, 6}))
+    b = r.broker
+    print(f"\nPlaced {b.placed['buy']} buys, {b.placed['sell']} sells, {b.placed['cancel']} cancels; never more than {b.max_offers} offers and {b.max_stacks} stacks at once; "
+          f"{b.rejected} instructions could not be carried out, {b.blocked} collections blocked by a full inventory.")
+    if r.cancel_reasons:
+        print("Cancels: " + ", ".join(f"{n} {k}" for k, n in sorted(r.cancel_reasons.items(), key=lambda kv: -kv[1])))
+    ranked = sorted(r.pnl_by_item.items(), key=lambda kv: kv[1], reverse=True)
+    if ranked:
+        print("\nRealised P&L by item (best and worst):")
+        shown = ranked[:12] + ([("...", 0)] if len(ranked) > 15 else []) + (ranked[-3:] if len(ranked) > 15 else ranked[12:])
+        print(_table(["Item", "Profit"], [[n, f"{p:+,}" if n != "..." else ""] for n, p in shown], right={1}))
+
+
+def cmd_execute(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None:
+    if args.backtest:
+        _exec_backtest(args, client)
+        return
+    d = _exec_dir(args)
+    status_path, orders_path, state_path = d / "status.json", d / "orders.json", d / "state.json"
+    if args.report:
+        _exec_report(d)
+        return
+    if args.init:
+        if state_path.exists() and not args.reset:
+            sys.exit(f"A session already exists in {d}. Keep feeding status.json, or add --reset to start over.")
+        for p in (state_path, orders_path):
+            p.unlink(missing_ok=True)
+        members = _members_filter(args)
+        start = {
+            "cash": parse_gp(args.cash or args.budget),
+            "members": members is not False,
+            "slots": args.slots if args.slots is not None else (3 if members is False else 8),
+            "inventory_capacity": args.inventory_slots,
+            "orders": [],
+        }
+        _write_json(status_path, start)
+        print(f"Session started in {d}\n  status.json  <- you write this (cash, orders, optionally inventory)\n  orders.json  <- the engine answers here")
+        print("Now run `ge-analyser execute` and leave it running.")
+        return
+
+    items = client.mapping()
+    engine = Executor(ExecState.load(state_path) if state_path.exists() else ExecState(), items, _exec_config(args))
+    if not args.once:
+        print(f"Execution loop: reading {status_path}, writing {orders_path}; answers every {args.interval}s and whenever status.json changes. Ctrl-C stops it.", flush=True)
+    seen = None
+    last_run = 0.0
+    while True:
+        sig = status_path.stat().st_mtime_ns if status_path.exists() else None
+        if sig != seen or time.time() - last_run >= args.interval:
+            seen, last_run = sig, time.time()
+            _exec_cycle(args, client, ledger, engine, items, d)
+            if args.once:
+                return
+        time.sleep(2)
 
 
 def main(argv: list[str] | None = None) -> None:

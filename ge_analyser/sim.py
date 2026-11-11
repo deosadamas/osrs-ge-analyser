@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .analysis import DEFAULT_PARAMS, Flip, ItemStats, ScoreParams, find_flips, ge_tax
+from .analysis import DEFAULT_PARAMS, MARGIN_CAP, Flip, ItemStats, ScoreParams, capped_ask, find_flips, ge_tax
 from .api import ItemInfo, LatestPrice, WindowPrice
 
 
@@ -87,6 +87,8 @@ class Config:
     min_roi: float = 0.02
     improve: bool = True  # bid 1 gp above instant-sell / ask 1 gp below instant-buy: you become the best offer
     min_stake: int = 0  # gp per slot; fewer slots are used until equity supports this many (0 = off)
+    margin_cap: float = MARGIN_CAP  # plan asks at most this multiple of the item's typical margin (0 = off)
+    require_history: bool = True  # with history features on, skip items that have no track record
     score: ScoreParams = DEFAULT_PARAMS
 
 
@@ -152,6 +154,20 @@ class Simulator:
         # Per-item history features for a given moment (time-of-week aware); None = legacy scoring.
         self.stats_at: Callable[[int], dict[int, ItemStats]] | None = None
         self.events: Callable[[dict], None] | None = None  # structured decision sink (see `simulate --events`)
+        self._stats: dict[int, ItemStats] | None = None
+        self._stats_ts = -1
+
+    def _stats_for(self, now: int) -> dict[int, ItemStats] | None:
+        if self.stats_at is None:
+            return None
+        if self._stats_ts != now:
+            self._stats, self._stats_ts = self.stats_at(now), now
+        return self._stats
+
+    def _capped(self, item_id: int, name: str, ask: int, cost: float, now: int) -> int:
+        """Hold a planned ask to the item's usual margin over cost (see analysis.capped_ask)."""
+        stats = self._stats_for(now)
+        return capped_ask(ask, cost, stats.get(item_id) if stats else None, name, self.cfg.margin_cap, floor_margin=self.cfg.min_margin)
 
     def usable_slots(self) -> int:
         # Equity proxy without a snapshot: cash + reserved + positions at cost.
@@ -212,6 +228,7 @@ class Simulator:
         ask = tick.high if tick.high and tick.high > price else price + 1
         if self.cfg.improve and ask - 1 > price:
             ask -= 1
+        ask = self._capped(o.item_id, o.name, ask, price, now)
         self._list_for_sale(self.items[o.item_id], qty, price, ask, now)
         self._log(now, f"BUY  {qty:,} x {o.name} @ {price:,} -> listing @ {ask:,}")
         self._event(now, "fill", self.items[o.item_id], qty, price, side="buy", ask=ask)
@@ -269,9 +286,10 @@ class Simulator:
                     self._event(now, "dump", self.items[o.item_id], o.remaining, tick.low, side="sell", was=o.price)
                     self._execute_sell(o, tick.low, o.remaining, now)
                 elif not o.repriced and age >= self.cfg.sell_reprice and tick.high and tick.high < o.price:
-                    self._log(now, f"REPRICE {o.name}: {o.price:,} -> {tick.high:,} after {age // 60}m")
-                    self._event(now, "reprice", self.items[o.item_id], o.remaining, tick.high, side="sell", was=o.price)
-                    o.price, o.repriced = tick.high, True
+                    new = self._capped(o.item_id, o.name, tick.high, o.cost_basis, now)
+                    self._log(now, f"REPRICE {o.name}: {o.price:,} -> {new:,} after {age // 60}m")
+                    self._event(now, "reprice", self.items[o.item_id], o.remaining, new, side="sell", was=o.price)
+                    o.price, o.repriced = new, True
 
     # ---- decisions -----------------------------------------------------
     def decide(self, latest: dict[int, LatestPrice], hour: dict[int, WindowPrice], now: int) -> list[Order]:
@@ -280,6 +298,7 @@ class Simulator:
             return []
         active = {o.item_id for o in self.state.orders}
         per_slot = self.state.cash // free
+        stats = self._stats_for(now)
         flips = find_flips(
             self.items,
             latest,
@@ -291,9 +310,10 @@ class Simulator:
             min_roi=self.cfg.min_roi,
             max_age_s=self.cfg.max_age,
             members=self.cfg.members,
-            stats=self.stats_at(now) if self.stats_at else None,
+            stats=stats,
             params=self.cfg.score,
             used=self.used_limits(now),
+            require_history=stats is not None and self.cfg.require_history,
         )
         placed: list[Order] = []
         for f in flips:
@@ -307,6 +327,10 @@ class Simulator:
                 improved_margin = (f.sell - 1) - ge_tax(f.sell - 1, f.item.name) - (f.buy + 1)
                 if improved_margin >= max(self.cfg.min_margin, 1):
                     bid, target = f.buy + 1, f.sell - 1
+            target = capped_ask(target, bid, f.stats, f.item.name, self.cfg.margin_cap)
+            margin = target - ge_tax(target, f.item.name) - bid
+            if margin < max(self.cfg.min_margin, 1) or margin < self.cfg.min_roi * bid:
+                continue  # not worth it once the planned ask is held to the item's usual margin
             qty = min(f.quantity, self.state.cash // bid)
             if qty <= 0:
                 continue

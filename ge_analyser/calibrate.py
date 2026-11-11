@@ -8,7 +8,7 @@ from __future__ import annotations
 import statistics
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from .analysis import ge_tax
 from .runelite import RealTrade
@@ -170,3 +170,78 @@ def calibrate(trades: list[RealTrade], history: dict[tuple[int, str], list[dict[
         else:
             c.loose_fills += 1
     return c
+
+
+# ---- execution loop: real fills against the paper fill model ---------------
+
+
+def model_fill(rows: Iterable[tuple], side: str, price: int, qty: int, start: int, end: int, fill_share: int = 10, strict: bool = True) -> float:
+    """Units the paper fill model (see broker.PaperBroker) gives an order that was live
+    from `start` to `end`. rows: 5m windows (ts, high, hvol, low, lvol). A window counts
+    in proportion to how much of it the order was live."""
+    total = 0.0
+    for ts, high, hvol, low, lvol in rows:
+        overlap = min(end, ts + 300) - max(start, ts)
+        if overlap <= 0:
+            continue
+        cap = 0
+        if side == "buy":
+            if low is not None and (low < price if strict else low <= price):
+                cap = max(lvol // fill_share, 1)
+        else:
+            if high is not None and (high > price if strict else high >= price):
+                cap = max(hvol // fill_share, 1)
+            if low is not None and low >= price:
+                cap = max(cap, lvol // fill_share, 1)
+        total += cap * overlap / 300
+    return min(total, float(qty))
+
+
+@dataclass
+class FillReality:
+    """Value-weighted units really filled / units the paper model would have filled."""
+
+    ratio: float | None  # None until at least one order has a model figure > 0
+    orders: int
+    per_item: dict[int, tuple[float, int]]  # item -> (ratio, orders)
+
+
+def fill_reality(orders: Iterable[Any], side: str | None = None, cap: float = 2.0) -> FillReality:
+    """orders: closed execution orders carrying `filled`, `price`, `model_fill`. Orders
+    the model gives nothing but that did fill count as `cap` (the model was too strict)."""
+    num = den = 0.0
+    n = 0
+    acc: dict[int, list[float]] = {}
+    for o in orders:
+        if o.model_fill is None or (side and o.side != side):
+            continue
+        real, model = o.filled * o.price, o.model_fill * o.price
+        n += 1
+        num += real
+        den += model
+        a = acc.setdefault(o.item_id, [0.0, 0.0, 0])
+        a[0] += real
+        a[1] += model
+        a[2] += 1
+
+    def ratio(real: float, model: float) -> float | None:
+        if model > 0:
+            return min(real / model, cap)
+        return cap if real > 0 else None
+
+    per = {}
+    for item_id, (real, model, count) in acc.items():
+        r = ratio(real, model)
+        if r is not None:
+            per[item_id] = (r, int(count))
+    return FillReality(ratio(num, den), n, per)
+
+
+def sizing_scales(reality: FillReality, min_orders: int = 10, min_item_orders: int = 3, floor: float = 0.1) -> tuple[float, dict[int, float]]:
+    """How much to scale order sizes by: (default, per item). Nothing changes until
+    there are enough finished orders to say something."""
+    default = 1.0
+    if reality.ratio is not None and reality.orders >= min_orders:
+        default = max(reality.ratio, floor)
+    per = {i: max(r, floor) for i, (r, n) in reality.per_item.items() if n >= min_item_orders}
+    return default, per

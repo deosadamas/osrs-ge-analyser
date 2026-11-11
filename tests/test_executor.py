@@ -1,0 +1,338 @@
+import pytest
+
+from ge_analyser.analysis import ItemStats, ask_for_margin, capped_ask, ge_tax
+from ge_analyser.api import ItemInfo, LatestPrice, WindowPrice
+from ge_analyser.executor import ExecConfig, ExecState, Executor, Market, StatusError, parse_status
+
+ORE, SALMON, WHIP, DEATH = 440, 329, 4151, 560
+ITEMS = {
+    ORE: ItemInfo(ORE, "Iron ore", False, 13000, 0, 0),
+    SALMON: ItemInfo(SALMON, "Salmon", False, 6000, 0, 0),
+    WHIP: ItemInfo(WHIP, "Abyssal whip", True, 70, 0, 0),
+    DEATH: ItemInfo(DEATH, "Death rune", True, 25000, 0, 0),
+}
+T0 = 1_700_000_000
+ORE_ONLY = {ORE: (100, 110)}  # instant-sell 100, instant-buy 110 -> bid 101, ask 109, +6/ea after tax
+BOTH = {ORE: (100, 110), SALMON: (50, 56)}
+
+
+def market(prices, now, stats=None, vol=10_000):
+    latest = {i: LatestPrice(high, now, low, now) for i, (low, high) in prices.items()}
+    return Market(latest=latest, hour={i: WindowPrice(None, vol, None, vol) for i in prices}, stats=stats)
+
+
+def engine(**cfg):
+    return Executor(ExecState(), ITEMS, ExecConfig(**cfg))
+
+
+def status(cash, orders=(), now=T0, **extra):
+    return parse_status({"cash": cash, "orders": list(orders), **extra}, ITEMS, now)
+
+
+def acts(plan, kind):
+    return [a for a in plan.actions if a["action"] == kind]
+
+
+# ---- status parsing ----------------------------------------------------------
+
+
+def test_parse_status_accepts_ids_names_and_synonyms():
+    s = parse_status(
+        {
+            "cash": "10k",
+            "f2p": True,
+            "slots": 3,
+            "orders": [
+                {"order_id": 4, "status": "Executed"},
+                {"order": 5, "state": "partially filled", "filled": 12},
+                {"item": "iron ore", "state": "SELLING", "filled": 3, "price": 109, "qty": 10},
+                {"item_id": SALMON, "side": "buy"},
+                {"item": "Salmon", "state": "EMPTY"},
+            ],
+            "inventory": [{"item": "Coins", "qty": 5000}, {"item": "Iron ore", "qty": 7}, {"item": "Lucky charm", "qty": 1}],
+        },
+        ITEMS,
+        T0,
+    )
+    assert s.cash == 10_000 and s.members is False and s.slots == 3
+    assert [(r.order_id, r.side, r.item_id, r.status, r.filled) for r in s.orders] == [
+        (4, None, None, "executed", None),
+        (5, None, None, "filling", 12),
+        (None, "sell", ORE, "filling", 3),
+        (None, "buy", SALMON, "open", None),
+    ]
+    assert s.inventory[ORE] == 7 and len(s.inventory) == 2  # coins skipped; the untradeable charm still takes a stack
+    assert parse_status({"cash": 5, "inventory": {"Iron ore": 3}}, ITEMS, T0).inventory == {ORE: 3}
+
+
+@pytest.mark.parametrize(
+    "raw, needle",
+    [
+        ({"orders": []}, "cash"),
+        ({"cash": 1, "orders": [{"order_id": 1, "status": "maybe"}]}, "unknown status"),
+        ({"cash": 1, "orders": [{"item": "Iron oar", "side": "buy"}]}, "unknown item name"),
+        ({"cash": 1, "orders": [{"status": "open"}]}, "order_id"),
+        ([1, 2], "JSON object"),
+    ],
+)
+def test_parse_status_says_what_to_fix(raw, needle):
+    with pytest.raises(StatusError, match=needle):
+        parse_status(raw, ITEMS, T0)
+
+
+# ---- planning ------------------------------------------------------------------
+
+
+def test_first_cycle_buys_within_slots_cash_and_improves_prices():
+    eng = engine()
+    plan = eng.step(status(10_000), market(BOTH, T0), T0)
+    buys = acts(plan, "BUY")
+    assert {b["item"] for b in buys} == {"Iron ore", "Salmon"}
+    ore = next(b for b in buys if b["item_id"] == ORE)
+    assert (ore["price"], ore["then_sell_at"], ore["profit_each"]) == (101, 109, 6)  # 1 gp better on both legs
+    assert sum(b["price"] * b["qty"] for b in buys) <= 10_000
+    assert [a["step"] for a in plan.actions] == list(range(1, len(plan.actions) + 1))
+    assert {o["order_id"] for o in plan.reply_template["orders"]} == {b["order_id"] for b in buys}
+    assert plan.account["ge_slots_used"] == 2 and plan.account["inventory_stacks"] == 2
+
+
+def test_fills_come_only_from_status_and_sell_follows_buy():
+    eng = engine()
+    plan = eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0)
+    (buy,) = acts(plan, "BUY")
+    assert (buy["qty"], buy["price"]) == (99, 101)  # all the cash, one slot
+    assert not eng.state.positions  # nothing is owned until the status says so
+
+    t = T0 + 60
+    plan = eng.step(status(1, [{"order_id": buy["order_id"], "status": "executed"}], t, slots=1), market(ORE_ONLY, t), t)
+    assert [a["action"] for a in plan.actions] == ["COLLECT", "SELL"]
+    sell = acts(plan, "SELL")[0]
+    assert (sell["qty"], sell["price"], sell["cost_each"]) == (99, 109, 101.0)
+    assert [f.side for f in plan.fills] == ["buy"] and plan.fills[0].qty == 99
+
+    t += 60
+    plan = eng.step(status(1, [{"order_id": sell["order_id"], "status": "filling", "filled": 40}], t, slots=1), market(ORE_ONLY, t), t)
+    assert [a["action"] for a in plan.actions] == ["HOLD"]
+    assert eng.state.realised == 40 * (109 - ge_tax(109) - 101) == 240
+
+    t += 60
+    cash = 1 + 99 * (109 - 2)
+    plan = eng.step(status(cash, [{"order_id": sell["order_id"], "status": "sold"}], t, slots=1), market(ORE_ONLY, t), t)
+    assert eng.state.realised == 99 * 6 and not eng.state.positions
+    assert [a["action"] for a in plan.actions] == ["COLLECT", "BUY"]  # the freed slot is put back to work at once
+    assert eng.state.sells == 2 and eng.state.wins == 2
+
+
+def test_executed_without_a_count_is_a_full_fill():
+    for report in ({"status": "executed"}, {"status": "executed", "filled": 0}):
+        eng = engine()
+        (buy,) = acts(eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+        eng.step(status(1, [{"order_id": buy["order_id"], **report}], T0 + 60, slots=1), market(ORE_ONLY, T0 + 60), T0 + 60)
+        assert eng.state.positions[ORE].qty == 99
+    # ...while a real smaller count means the offer placed was smaller
+    eng = engine()
+    (buy,) = acts(eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+    eng.step(status(1, [{"order_id": buy["order_id"], "status": "executed", "filled": 60}], T0 + 60, slots=1), market(ORE_ONLY, T0 + 60), T0 + 60)
+    assert eng.state.positions[ORE].qty == 60
+
+
+def test_instruction_repeats_unchanged_until_seen_then_is_replanned():
+    eng = engine(pending_ttl=180)
+    (first,) = acts(eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+    moved = {ORE: (101, 111)}  # the market ticks up; the instruction you are typing in must not change under you
+    (again,) = acts(eng.step(status(10_000, slots=1, now=T0 + 60), market(moved, T0 + 60), T0 + 60), "BUY")
+    assert (again["order_id"], again["price"], again["qty"]) == (first["order_id"], first["price"], first["qty"])
+    assert "not in your status yet" in again["why"]
+    (later,) = acts(eng.step(status(10_000, slots=1, now=T0 + 200), market(moved, T0 + 200), T0 + 200), "BUY")
+    assert later["order_id"] != first["order_id"] and later["price"] == 102  # re-planned at today's price
+    # A withdrawn instruction that was placed after all is taken back on the book.
+    plan = eng.step(status(20_000, [{"order_id": first["order_id"], "status": "open"}], T0 + 260, slots=2), market(moved, T0 + 260), T0 + 260)
+    assert [o.id for o in eng.state.orders if o.state == "working"] == [first["order_id"]]
+    assert not acts(plan, "BUY")  # ...and the replacement instruction for the same item is dropped, not doubled up
+
+
+def test_buy_timeout_cancels_and_reuses_the_coins_in_the_same_batch():
+    eng = engine(buy_timeout=1800)
+    (first,) = acts(eng.step(status(10_000, slots=1), market(BOTH, T0), T0), "BUY")
+    left = 10_000 - first["price"] * first["qty"]
+    open_report = [{"order_id": first["order_id"], "status": "open"}]
+    t = T0 + 60
+    plan = eng.step(status(left, open_report, t, slots=1), market(BOTH, t), t)
+    assert [a["action"] for a in plan.actions] == ["HOLD"]
+    t += 1800
+    plan = eng.step(status(left, open_report, t, slots=1), market(BOTH, t), t)
+    assert [a["action"] for a in plan.actions] == ["CANCEL", "BUY"]
+    cancel, new = plan.actions
+    assert cancel["order_id"] == first["order_id"] and "no fill" in cancel["why"]
+    assert new["item_id"] != first["item_id"]  # the stale item is not re-bid in the same breath
+    assert left < new["price"] * new["qty"] <= 10_000  # sized with the refund, not just the loose coins
+    # Still open next time: the cancel is repeated, not forgotten.
+    t += 60
+    plan = eng.step(status(left, open_report, t, slots=1), market(BOTH, t), t)
+    assert acts(plan, "CANCEL")[0]["order_id"] == first["order_id"]
+    # Reported cancelled: it leaves the book and nothing was bought.
+    t += 60
+    eng.step(status(10_000, [{"order_id": first["order_id"], "status": "cancelled"}], t, slots=1), market(BOTH, t), t)
+    assert all(o.id != first["order_id"] for o in eng.state.orders) and not eng.state.positions
+
+
+@pytest.mark.parametrize("cancel_on_margin", [True, False])
+def test_buy_is_cancelled_when_the_margin_is_gone(cancel_on_margin):
+    eng = engine(cancel_on_margin=cancel_on_margin)
+    (buy,) = acts(eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+    report = [{"order_id": buy["order_id"], "status": "open"}]
+    t = T0 + 60
+    assert acts(eng.step(status(1, report, t, slots=1), market(ORE_ONLY, t), t), "HOLD")
+    t += 60
+    plan = eng.step(status(1, report, t, slots=1), market({ORE: (95, 102)}, t), t)  # buyers now pay 102: 102 - 2 - 101 < 0
+    if cancel_on_margin:
+        assert "margin gone" in acts(plan, "CANCEL")[0]["why"]
+    else:
+        assert [a["action"] for a in plan.actions] == ["HOLD"]
+
+
+def test_sell_is_repriced_then_dumped():
+    eng = engine(sell_reprice=1800, sell_dump=5400, dump_retry=600)
+    (buy,) = acts(eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+    t = T0 + 60
+    (sell,) = acts(eng.step(status(1, [{"order_id": buy["order_id"], "status": "bought"}], t, slots=1), market(ORE_ONLY, t), t), "SELL")
+    listed = t + 60
+    working = [{"order_id": sell["order_id"], "status": "open"}]
+    eng.step(status(1, working, listed, slots=1), market(ORE_ONLY, listed), listed)
+
+    t = listed + 1800
+    plan = eng.step(status(1, working, t, slots=1), market({ORE: (99, 105)}, t), t)  # no sale for 30 min, buyers pay 105
+    assert [a["action"] for a in plan.actions] == ["CANCEL", "SELL"]
+    relist = acts(plan, "SELL")[0]
+    assert relist["price"] == 104 and relist["qty"] == 99 and relist["order_id"] != sell["order_id"]
+
+    t += 60
+    reports = [{"order_id": sell["order_id"], "status": "cancelled", "filled": 0}, {"order_id": relist["order_id"], "status": "open"}]
+    plan = eng.step(status(1, reports, t, slots=1), market({ORE: (99, 105)}, t), t)
+    assert [a["action"] for a in plan.actions] == ["COLLECT", "HOLD"]  # repriced once; now it waits
+
+    t = listed + 5400
+    plan = eng.step(status(1, reports[1:], t, slots=1), market({ORE: (98, 104)}, t), t)
+    dump = acts(plan, "SELL")[0]
+    assert "instant-sell" in acts(plan, "CANCEL")[0]["why"] and dump["price"] == 98
+    assert dump["profit_each"] < 0  # cutting a loser is a loss, and is reported as one
+
+
+def test_partial_fills_are_listed_only_once_they_matter():
+    eng = engine(partial_sell_frac=0.2)
+    (buy,) = acts(eng.step(status(10_000, slots=2), market(ORE_ONLY, T0), T0), "BUY")
+    assert buy["qty"] == 50
+    t = T0 + 60
+    plan = eng.step(status(4950, [{"order_id": buy["order_id"], "status": "filling", "filled": 5}], t, slots=2), market(ORE_ONLY, t), t)
+    assert not acts(plan, "SELL")
+    assert any(a.get("side") == "inventory" and "bought so far" in a["why"] for a in acts(plan, "HOLD"))
+    t += 60
+    plan = eng.step(status(4950, [{"order_id": buy["order_id"], "status": "filling", "filled": 12}], t, slots=2), market(ORE_ONLY, t), t)
+    (sell,) = acts(plan, "SELL")
+    assert sell["qty"] == 12 and sell["collect_first"] == [buy["order_id"]]
+    # More units arrive while that sell works: they wait, one sell offer per item.
+    t += 60
+    reports = [{"order_id": buy["order_id"], "status": "filling", "filled": 30}, {"order_id": sell["order_id"], "status": "open"}]
+    plan = eng.step(status(4950, reports, t, slots=2), market(ORE_ONLY, t), t)
+    assert not acts(plan, "SELL") and any("18 more wait" in a["why"] for a in acts(plan, "HOLD"))
+
+
+# ---- constraints ------------------------------------------------------------------
+
+
+def test_inventory_capacity_limits_new_item_stacks():
+    junk = [{"item": f"Junk {i}", "qty": 1} for i in range(26)]
+    eng = engine()
+    plan = eng.step(status(10_000, inventory=junk), market(BOTH, T0), T0)
+    assert not acts(plan, "BUY") and plan.account["inventory_stacks"] == 26
+    eng = engine()
+    plan = eng.step(status(10_000, inventory=junk, inventory_capacity=27), market(BOTH, T0), T0)
+    assert len(acts(plan, "BUY")) == 1  # one free stack: one new item, not two
+
+
+def test_slots_are_shared_with_offers_the_engine_did_not_place():
+    eng = engine()
+    foreign = [
+        {"item": "Abyssal whip", "side": "buy", "status": "open", "price": 1, "qty": 1},
+        {"item": "Death rune", "side": "sell", "status": "filling", "filled": 3},
+    ]
+    plan = eng.step(status(10_000, foreign, slots=3), market(BOTH, T0), T0)
+    assert len(acts(plan, "BUY")) == 1
+    assert sum("not placed by this engine" in a["why"] for a in acts(plan, "HOLD")) == 2
+    assert plan.account["ge_slots_used"] == 3
+
+
+def test_free_to_play_status_limits_items_and_slots():
+    eng = engine()
+    prices = {ORE: (100, 110), DEATH: (200, 220), SALMON: (50, 56), WHIP: (1000, 1100)}
+    plan = eng.step(status(1_000_000, members=False), market(prices, T0), T0)
+    assert {b["item"] for b in acts(plan, "BUY")} == {"Iron ore", "Salmon"}
+    assert plan.account["ge_slots"] == 3 and plan.account["items_allowed"] == "free-to-play"
+
+
+def test_missing_order_is_asked_about_then_assumed_cancelled():
+    eng = engine(missing_grace=120)
+    (buy,) = acts(eng.step(status(10_000, slots=1), market(BOTH, T0), T0), "BUY")
+    left = 10_000 - buy["price"] * buy["qty"]
+    t = T0 + 60
+    eng.step(status(left, [{"order_id": buy["order_id"], "status": "filling", "filled": 10}], t, slots=1), market(BOTH, t), t)
+    t += 60
+    plan = eng.step(status(left, [], t, slots=1), market(BOTH, t), t)
+    (ask,) = [a for a in acts(plan, "HOLD") if a.get("needs_status")]
+    assert ask["order_id"] == buy["order_id"] and not acts(plan, "BUY")  # its slot is not given away on a guess
+    t += 120
+    plan = eng.step(status(left, [], t, slots=1), market(BOTH, t), t)
+    assert any("assumed cancelled at 10/" in w for w in plan.warnings)
+    assert eng.state.positions[buy["item_id"]].qty == 10  # what was known to be bought is kept and now sold
+    assert acts(plan, "SELL")[0]["qty"] == 10
+
+
+def test_missing_order_is_settled_from_the_inventory_when_reported():
+    eng = engine()
+    (buy,) = acts(eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+    t = T0 + 60
+    eng.step(status(1, [{"order_id": buy["order_id"], "status": "filling", "filled": 10}], t, slots=1), market(ORE_ONLY, t), t)
+    t += 60
+    plan = eng.step(status(1, [], t, slots=1, inventory=[{"item": "Iron ore", "qty": 99}]), market(ORE_ONLY, t), t)
+    assert eng.state.positions[ORE].qty == 99 and not plan.warnings  # the stack shows it filled completely
+    assert acts(plan, "SELL")[0]["qty"] == 99
+
+
+# ---- outlier guards ------------------------------------------------------------------
+
+
+def test_ask_for_margin_and_cap():
+    assert ask_for_margin(100, 6) == 108  # 108 - 2 tax - 100
+    assert ask_for_margin(10, 2) == 12  # under 50 gp: untaxed
+    assert ask_for_margin(100, 6, "Old school bond") == 106  # exempt
+    big = ask_for_margin(1_000_000, 20_000)
+    assert big - ge_tax(big) - 1_000_000 >= 20_000 > (big - 1) - ge_tax(big - 1) - 1_000_000
+    usual = ItemStats(windows=500, fill_buy=0.5, fill_sell=0.5, median_margin=3, volatility_pct=0.5, typical_volume=10_000)
+    assert capped_ask(49_998, 501, usual, cap=2.0) == ask_for_margin(501, 6)
+    assert capped_ask(505, 501, usual, cap=2.0) == 505  # already inside the usual margin
+    assert capped_ask(49_998, 501, None) == 49_998 and capped_ask(49_998, 501, usual, cap=0) == 49_998
+
+
+def test_engine_ignores_freak_prints_and_items_without_history():
+    usual = ItemStats(windows=500, fill_buy=0.5, fill_sell=0.5, median_margin=3, volatility_pct=0.5, typical_volume=10_000)
+    eng = engine()
+    # Iron ore usually spreads 3 gp; today someone paid 49,999. Salmon has no history at all.
+    plan = eng.step(status(10_000), market({ORE: (100, 49_999), SALMON: (50, 56)}, T0, stats={ORE: usual}), T0)
+    (buy,) = acts(plan, "BUY")
+    assert buy["item"] == "Iron ore" and buy["price"] == 101
+    assert buy["then_sell_at"] == ask_for_margin(101, 6) == 109  # twice the usual margin, not 49,998
+    # Holding it later, the listing is capped the same way whatever the last print says.
+    t = T0 + 60
+    plan = eng.step(status(1, [{"order_id": buy["order_id"], "status": "executed"}], t), market({ORE: (100, 49_999)}, t, stats={ORE: usual}), t)
+    assert acts(plan, "SELL")[0]["price"] == 109
+
+
+def test_state_roundtrip(tmp_path):
+    eng = engine()
+    (buy,) = acts(eng.step(status(10_000, slots=1), market(ORE_ONLY, T0), T0), "BUY")
+    eng.step(status(1, [{"order_id": buy["order_id"], "status": "filling", "filled": 30}], T0 + 60, slots=1), market(ORE_ONLY, T0 + 60), T0 + 60)
+    eng.state.save(tmp_path / "state.json")
+    loaded = ExecState.load(tmp_path / "state.json")
+    assert loaded.positions[ORE].qty == 30 and loaded.positions[ORE].cost == 101
+    assert [(o.id, o.state, o.filled) for o in loaded.orders] == [(o.id, o.state, o.filled) for o in eng.state.orders]
+    assert loaded.next_id == eng.state.next_id and loaded.seq == 2

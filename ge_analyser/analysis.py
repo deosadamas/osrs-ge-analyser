@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .api import ItemInfo, LatestPrice, WindowPrice
 
@@ -96,8 +96,35 @@ class ItemStats:
 
 
 # Used when history is enabled but an item has too few two-sided 5m windows to measure:
-# such items are illiquid, so assume both legs rarely fill and trust today's margin.
+# such items are illiquid, so assume both legs rarely fill and trust no more than a
+# modest margin (UNKNOWN_MAX_ROI of the price) however wide today's spread looks.
 UNKNOWN_STATS = ItemStats(windows=0, fill_buy=0.1, fill_sell=0.1, median_margin=0, volatility_pct=0.0, typical_volume=0)
+UNKNOWN_MAX_ROI = 0.10
+
+# Never plan to sell for more than this multiple of an item's typical margin over cost.
+# A print far above that is a one-off (a fat finger, coins being moved between two
+# accounts through a junk item), not a price level a third party can sell at.
+MARGIN_CAP = 2.0
+
+
+def ask_for_margin(cost: float, margin: float, name: str = "") -> int:
+    """Smallest ask whose after-tax profit over `cost` is at least `margin`."""
+    ask = max(math.ceil(cost + margin), 1)
+    if ge_tax(ask, name) > 0:
+        est = int((cost + margin) / (1 - TAX_RATE)) - 2  # tax is 2% rounded down: jump close, then walk up
+        ask = max(ask, est if ge_tax(est, name) < TAX_CAP else int(cost + margin + TAX_CAP) - 2)
+    while ask - ge_tax(ask, name) - cost < margin:
+        ask += 1
+    return ask
+
+
+def capped_ask(ask: int, cost: float, stats: ItemStats | None, name: str = "", cap: float = MARGIN_CAP, floor_margin: float = 0.0) -> int:
+    """Limit a planned ask to `cap` x the item's typical margin over `cost` (but never
+    below `floor_margin` over cost). No history, or cap <= 0: no limit."""
+    if stats is None or stats.windows == 0 or cap <= 0:
+        return ask
+    return min(ask, ask_for_margin(cost, max(stats.median_margin * cap, floor_margin), name))
+
 
 @dataclass(frozen=True)
 class Flip:
@@ -125,12 +152,19 @@ def remaining_limit(item: ItemInfo, used: int) -> int:
     return max(item.limit - used, 0)
 
 
-def flip_quantity(item: ItemInfo, buy: int, hourly_volume: int, budget: int, used: int = 0) -> int:
+# Share of an hour's two-sided volume one order is sized to. The ranking commands and
+# the legacy simulator use 1/4; the execution engine passes the share it expects to be
+# filled within its buy timeout (and scales it by what your real fills show).
+DEFAULT_VOLUME_FRAC = 0.25
+
+
+def flip_quantity(
+    item: ItemInfo, buy: int, hourly_volume: int, budget: int, used: int = 0, volume_frac: float = DEFAULT_VOLUME_FRAC
+) -> int:
     """Units for one flip cycle: bounded by remaining buy limit, budget, and recent volume."""
     by_budget = budget // buy if buy > 0 else 0
     by_limit = remaining_limit(item, used) if item.limit > 0 else by_budget
-    # Assume you can capture at most ~1/4 of an hour's two-sided volume.
-    by_volume = max(hourly_volume // 4, 1)
+    by_volume = max(int(hourly_volume * volume_frac), 1)
     return max(min(by_budget, by_limit, by_volume), 0)
 
 
@@ -154,6 +188,7 @@ def evaluate_flip(
     used: int = 0,
     stats: ItemStats | None = None,
     params: ScoreParams = DEFAULT_PARAMS,
+    volume_frac: float = DEFAULT_VOLUME_FRAC,
 ) -> Flip | None:
     if latest.high is None or latest.low is None or latest.high_time is None or latest.low_time is None:
         return None
@@ -168,7 +203,7 @@ def evaluate_flip(
     # Liquidity we plan on: never more than the market is doing right now, and never
     # more than this item typically does at this time of week.
     liq = min(hourly_volume, stats.typical_volume) if stats and stats.typical_volume > 0 else hourly_volume
-    qty = flip_quantity(item, buy, liq, budget, used)
+    qty = flip_quantity(item, buy, liq, budget, used, volume_frac)
     if qty == 0:
         return None
     profit = margin * qty
@@ -184,7 +219,7 @@ def evaluate_flip(
     else:
         # With history: expected profit = typical margin (not today's spike) x units x
         # probability both legs fill, then penalised when 5m volatility rivals the margin.
-        typical = margin if stats.windows == 0 else stats.median_margin
+        typical = int(buy * UNKNOWN_MAX_ROI) if stats.windows == 0 else stats.median_margin
         edge = max(min(margin, typical), 1)
         expected = int(edge * qty * stats.p_fill)
         risk = 1.0 / (1.0 + params.vol_penalty * stats.volatility_pct / max(roi * 100, 0.01))
@@ -222,6 +257,8 @@ def find_flips(
     used: dict[int, int] | None = None,
     stats: dict[int, ItemStats] | None = None,
     params: ScoreParams = DEFAULT_PARAMS,
+    volume_frac: float | Callable[[int], float] = DEFAULT_VOLUME_FRAC,
+    require_history: bool = False,
 ) -> list[Flip]:
     used = used or {}
     out: list[Flip] = []
@@ -232,7 +269,10 @@ def find_flips(
         if members is not None and item.members != members:
             continue
         item_stats = None if stats is None else stats.get(item_id, UNKNOWN_STATS)
-        flip = evaluate_flip(item, price, hour.get(item_id), budget, now, used.get(item_id, 0), item_stats, params)
+        if require_history and item_stats is not None and item_stats.windows == 0:
+            continue  # no track record: today's prices cannot be checked against anything
+        frac = volume_frac(item_id) if callable(volume_frac) else volume_frac
+        flip = evaluate_flip(item, price, hour.get(item_id), budget, now, used.get(item_id, 0), item_stats, params, frac)
         if flip is None:
             continue
         if flip.liquidity < min_volume or flip.margin < min_margin:
