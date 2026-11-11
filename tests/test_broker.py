@@ -110,6 +110,22 @@ def test_offers_keep_filling_while_you_are_away_but_nothing_is_managed():
     assert hourly.profit_per_hour == (hourly.equity - 10_000) / 0.75  # measured per hour actually spent at the GE
 
 
+def test_engine_counts_the_coins_exactly_through_timeouts_reprices_and_dumps():
+    def window(k):
+        salmon = 80 - k // 6  # falls steadily: stock goes under water and has to be repriced, then dumped
+        return {
+            # Iron ore: a wide spread, but sellers cross the bid only every 4th window -> part fills, then timeouts
+            ORE: {"avgHighPrice": 110 + k % 2, "highPriceVolume": 300, "avgLowPrice": 99 if k % 4 == 0 else 102, "lowPriceVolume": 300},
+            329: {"avgHighPrice": salmon + 6, "highPriceVolume": 400, "avgLowPrice": salmon - (k % 3 == 0), "lowPriceVolume": 400},
+        }
+
+    cfg = ExecConfig(slots=3, inventory_slots=2, max_age=600, buy_timeout=900, sell_reprice=900, sell_dump=1800)
+    r = run_backtest([(T0 + k * 300, window(k)) for k in range(200)], ITEMS, cfg, 10_000, start=T0 + 12 * 300)
+    assert {"buy timeout", "reprice", "dump"} <= set(r.cancel_reasons) and r.state.wins < r.state.sells  # every path was taken
+    # The paper account states its coins once; after that the engine's own count has to be right to the coin.
+    assert r.coin_drift == 0 and r.broker.rejected == 0
+
+
 def test_model_fill_weights_windows_by_how_long_the_order_was_live():
     rows = [
         (T0, 110, 500, 99, 1000),  # live for the last 150 s of this window

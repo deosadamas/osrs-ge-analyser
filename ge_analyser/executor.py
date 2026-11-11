@@ -71,7 +71,7 @@ class OrderReport:
 @dataclass
 class Status:
     ts: int
-    cash: int
+    cash: int | None  # coins in the inventory; None = no correction, the engine's own count stands
     orders: list[OrderReport] = field(default_factory=list)
     inventory: dict[int, int] | None = None  # item id -> units; None = not reported
     slots: int | None = None
@@ -108,8 +108,6 @@ def parse_status(raw: Any, items: dict[int, ItemInfo], ts: int) -> Status:
     if not isinstance(raw, dict):
         raise StatusError("status must be a JSON object")
     cash = _first(raw, "cash", "coins", "gp")
-    if cash is None:
-        raise StatusError('status needs "cash": the coins you can spend right now')
     names = {it.name.lower(): it.id for it in items.values()}
 
     def item_of(entry: dict, strict: bool) -> int | None:
@@ -204,7 +202,7 @@ def parse_status(raw: Any, items: dict[int, ItemInfo], ts: int) -> Status:
         raise StatusError('"members" must be true or false')
     return Status(
         ts=ts,
-        cash=_int(cash, "cash"),
+        cash=_int(cash, "cash") if cash is not None else None,
         orders=orders,
         inventory=inventory,
         slots=_int(slots, "slots") if slots is not None else None,
@@ -280,6 +278,18 @@ class ExecState:
     wins: int = 0
     start_ts: int = 0
     start_equity: int = 0
+    # The coin count: cash = cash_anchor + flow - coins locked in working buy offers.
+    flow: int = 0  # sale proceeds after tax minus purchase cost, over every fill reported
+    cash_anchor: int | None = None  # set whenever a status corrects the count
+    cash_given: int | None = None  # the last "cash" a status stated
+    # Account settings last given in a status; they stick until a status changes them.
+    members: bool | None = None
+    slots: int | None = None
+    inventory_capacity: int | None = None
+
+    def locked(self) -> int:
+        """Coins sitting in buy offers the status has confirmed."""
+        return sum(o.price * o.remaining for o in self.orders if o.side == "buy" and o.state == "working")
 
     def save(self, path: Path) -> None:
         raw = asdict(self)
@@ -319,6 +329,7 @@ class ExecConfig:
     partial_sell_frac: float = 0.2  # list a still-filling buy's units once they are worth this share of the order
     cancel_on_margin: bool = True
     margin_cap: float = MARGIN_CAP  # plan asks at most this multiple of the item's typical margin over cost (0 = off)
+    min_order_frac: float = 0.02  # a new buy must be worth at least this share of your equity: no dust orders
     score: ScoreParams = DEFAULT_PARAMS
 
 
@@ -414,6 +425,7 @@ class Executor:
             pos.qty += units
             if o.target:
                 pos.target = o.target
+            st.flow -= unit_price * units
             fills.append(Fill(now, o.id, "buy", o.item_id, o.name, units, unit_price, 0, 0))
         else:
             tax = ge_tax(unit_price, o.name)
@@ -427,6 +439,7 @@ class Executor:
                 pos.qty -= units
                 if pos.qty <= 0:
                     del st.positions[o.item_id]
+            st.flow += (unit_price - tax) * units
             fills.append(Fill(now, o.id, "sell", o.item_id, o.name, units, unit_price, tax * units, profit))
         o.filled += units
         o.gross += unit_price * units
@@ -653,7 +666,7 @@ class Executor:
         return free
 
     # -- new buy offers ---------------------------------------------------------
-    def _plan_buys(self, market: Market, now: int, free: int, cash: int, held: set[int], capacity: int, members: bool | None, buy: list[dict]) -> None:
+    def _plan_buys(self, market: Market, now: int, free: int, cash: int, held: set[int], capacity: int, members: bool | None, buy: list[dict], equity: int) -> None:
         st, cfg = self.state, self.cfg
         working = {o.item_id for o in st.orders if o.state == "working"}
         for o in [o for o in st.orders if o.side == "buy" and o.state == "pending"]:
@@ -675,8 +688,13 @@ class Executor:
             cash -= o.price * o.qty
             free -= 1
             held.add(o.item_id)
-        if free <= 0 or cash <= 0:
+        # Loose change is not spread over dust orders: with less than `floor` to spend nothing
+        # new is bought, and the per-order budget never falls below it. An order the market
+        # itself keeps small (thin volume, buy limit) is not dust and is placed all the same.
+        floor = max(int(cfg.min_order_frac * equity), 1)
+        if free <= 0 or cash < floor:
             return
+        spread = min(free, cash // floor)
         busy = set(st.positions) | {o.item_id for o in st.orders}
         base = cfg.volume_frac if cfg.volume_frac is not None else (cfg.buy_timeout / 3600) / cfg.fill_share
         scale, default = market.volume_scale, market.default_scale
@@ -685,7 +703,7 @@ class Executor:
             self.items,
             market.latest,
             market.hour,
-            budget=cash // free,
+            budget=cash // spread,
             now=now,
             min_volume=cfg.min_volume,
             min_margin=cfg.min_margin,
@@ -699,8 +717,10 @@ class Executor:
             require_history=market.stats is not None,
         )
         for f in flips:
-            if free <= 0:
-                break
+            if free <= 0 or cash < floor:
+                break  # what is left is loose change: it waits for a sale instead of becoming a dust order
+            if f.score <= 0:
+                break  # ranked by score: nothing below has any expected profit
             if f.item.id in busy:
                 continue
             if f.item.id not in held and len(held) >= capacity:
@@ -729,6 +749,8 @@ class Executor:
     # -- one cycle ----------------------------------------------------------------
     def step(self, status: Status, market: Market, now: int) -> Plan:
         st, cfg = self.state, self.cfg
+        if status.cash is None and st.cash_anchor is None:
+            raise StatusError('the first status needs "cash": the coins in your inventory')
         st.seq += 1
         collect: list[dict] = []
         cancel: list[dict] = []
@@ -738,13 +760,32 @@ class Executor:
         warnings: list[str] = []
         fills: list[Fill] = []
 
-        members = cfg.members
+        # Account settings stick: a status that leaves them out keeps the last ones given.
         if status.members is not None:
-            members = None if status.members else False
-        slots_total = status.slots or (min(cfg.slots, 3) if status.members is False else cfg.slots)
-        capacity = status.inventory_capacity or cfg.inventory_slots
+            st.members = status.members
+        if status.slots is not None:
+            st.slots = status.slots
+        if status.inventory_capacity is not None:
+            st.inventory_capacity = status.inventory_capacity
+        members = cfg.members
+        if st.members is not None:
+            members = None if st.members else False
+        slots_total = st.slots or (min(cfg.slots, 3) if st.members is False else cfg.slots)
+        capacity = st.inventory_capacity or cfg.inventory_slots
 
         occupied = self._reconcile(status, now, fills, collect, hold, warnings)
+
+        # Coins are counted from the book: what you started with, plus every sale and minus
+        # every purchase you reported, minus what is locked in buy offers. A "cash" figure is
+        # a correction only when you change it - the same number again says nothing new.
+        reserved = st.locked()
+        correction = 0
+        if status.cash is not None and (st.cash_anchor is None or status.cash != st.cash_given):
+            if st.cash_anchor is not None:
+                correction = status.cash - (st.cash_anchor + st.flow - reserved)
+            st.cash_anchor = status.cash - st.flow + reserved
+            st.cash_given = status.cash
+        coins = st.cash_anchor + st.flow - reserved
 
         freed_cash = 0
         for o in list(st.orders):
@@ -761,7 +802,7 @@ class Executor:
                 occupied += 1
                 hold.append(self._line("HOLD", o, why))
         free = max(slots_total - occupied, 0)
-        cash = max(status.cash, 0) + freed_cash
+        cash = max(coins, 0) + freed_cash
 
         held = {i for i, p in st.positions.items() if p.qty > 0}
         held |= {o.item_id for o in st.orders if o.side == "buy" and o.state == "working"}
@@ -770,21 +811,22 @@ class Executor:
         if len(held) > capacity:
             warnings.append(f"{len(held)} item stacks held or incoming but capacity is {capacity}: no new items until some sell")
 
-        free = self._plan_sells(market, now, free, sell, hold)
-        self._plan_buys(market, now, free, cash, held, capacity, members, buy)
-
-        actions = [{"step": n, **a} for n, a in enumerate(collect + cancel + sell + buy + hold, 1)]
-
-        reserved = sum(o.price * o.remaining for o in st.orders if o.side == "buy" and o.state == "working")
         stock = 0
         for i, p in st.positions.items():
             lp = market.latest.get(i)
             stock += p.qty * (lp.low if lp and lp.low else int(p.cost))
-        equity = status.cash + reserved + stock
+        equity = coins + reserved + stock
         if not st.start_ts:
             st.start_ts, st.start_equity = now, equity
+
+        free = self._plan_sells(market, now, free, sell, hold)
+        self._plan_buys(market, now, free, cash, held, capacity, members, buy, equity)
+
+        actions = [{"step": n, **a} for n, a in enumerate(collect + cancel + sell + buy + hold, 1)]
         account = {
-            "cash": status.cash,
+            "cash": coins,
+            "cash_after_actions": coins + freed_cash - sum(a["price"] * a["qty"] for a in buy),
+            "cash_correction": correction,
             "in_buy_offers": reserved,
             "stock_value": stock,
             "equity_est": equity,
@@ -807,5 +849,6 @@ class Executor:
                 expect.append({"order_id": o.id, "item": o.name, "side": o.side, "status": "filling" if o.filled else "open", "filled": o.filled})
             elif o.state == "pending":
                 expect.append({"order_id": o.id, "item": o.name, "side": o.side, "status": "open", "filled": 0})
-        reply = {"cash": status.cash, "orders": expect}
+        # Settings and orders only: copying this over status.json can never feed back a stale coin count.
+        reply = {"members": members is not False, "slots": slots_total, "inventory_capacity": capacity, "orders": expect}
         return Plan(st.seq, now, status.ts, actions, warnings, fills, account, reply)

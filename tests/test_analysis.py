@@ -48,20 +48,24 @@ def test_find_flips_filters_and_sorts():
         2: ItemInfo(2, "Stale", False, 1000, 0, 0),
         3: ItemInfo(3, "Illiquid", False, 1000, 0, 0),
         4: ItemInfo(4, "Better", False, 1000, 0, 0),
+        5: ItemInfo(5, "Old school bond", False, 100, 0, 0),
     }
     latest = {
         1: LatestPrice(1100, NOW, 1000, NOW),
         2: LatestPrice(1100, NOW - 7200, 1000, NOW),
         3: LatestPrice(1100, NOW, 1000, NOW),
         4: LatestPrice(1300, NOW, 1000, NOW),
+        5: LatestPrice(2000, NOW, 1000, NOW),  # the widest spread of all, and untaxed
     }
     hour = {
         1: WindowPrice(None, 400, None, 400),
         2: WindowPrice(None, 400, None, 400),
         3: WindowPrice(None, 10, None, 10),
         4: WindowPrice(None, 400, None, 400),
+        5: WindowPrice(None, 400, None, 400),
     }
     flips = find_flips(items, latest, hour, budget=10_000_000, now=NOW, min_volume=50, max_age_s=3600)
+    # A bond bought on the GE comes back untradeable: it is never a flip, whatever its spread.
     assert [f.item.name for f in flips] == ["Better", "Fresh"]
 
 

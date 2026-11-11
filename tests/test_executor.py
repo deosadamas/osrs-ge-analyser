@@ -2,7 +2,7 @@ import pytest
 
 from ge_analyser.analysis import ItemStats, ask_for_margin, capped_ask, ge_tax
 from ge_analyser.api import ItemInfo, LatestPrice, WindowPrice
-from ge_analyser.executor import ExecConfig, ExecState, Executor, Market, StatusError, parse_status
+from ge_analyser.executor import ExecConfig, ExecOrder, ExecState, Executor, Market, StatusError, parse_status
 
 ORE, SALMON, WHIP, DEATH = 440, 329, 4151, 560
 ITEMS = {
@@ -68,7 +68,7 @@ def test_parse_status_accepts_ids_names_and_synonyms():
 @pytest.mark.parametrize(
     "raw, needle",
     [
-        ({"orders": []}, "cash"),
+        ({"cash": "lots", "orders": []}, "cash must be a number"),
         ({"cash": 1, "orders": [{"order_id": 1, "status": "maybe"}]}, "unknown status"),
         ({"cash": 1, "orders": [{"item": "Iron oar", "side": "buy"}]}, "unknown item name"),
         ({"cash": 1, "orders": [{"status": "open"}]}, "order_id"),
@@ -121,6 +121,40 @@ def test_fills_come_only_from_status_and_sell_follows_buy():
     assert eng.state.realised == 99 * 6 and not eng.state.positions
     assert [a["action"] for a in plan.actions] == ["COLLECT", "BUY"]  # the freed slot is put back to work at once
     assert eng.state.sells == 2 and eng.state.wins == 2
+
+
+def test_coins_are_counted_from_reports_and_cash_is_only_a_correction():
+    eng = engine()
+    with pytest.raises(StatusError, match="first status needs"):
+        eng.step(status(None), market(ORE_ONLY, T0), T0)
+    assert eng.state.seq == 0  # a status that cannot be used changes nothing
+
+    (buy,) = acts(eng.step(status(10_000, slots=2), market(ORE_ONLY, T0), T0), "BUY")
+    assert (buy["qty"], buy["price"]) == (50, 101)
+    oid, t = buy["order_id"], T0
+
+    def coins(orders, cash=None):
+        nonlocal t
+        t += 60
+        plan = eng.step(status(cash, orders, t), market(ORE_ONLY, t), t)
+        return plan.account["cash"], plan
+
+    assert coins([])[0] == 10_000  # instructed, not placed: nothing is locked yet
+    assert coins([{"order_id": oid, "status": "open"}])[0] == 4_950  # 5,050 went into the offer
+    assert coins([{"order_id": oid, "status": "filling", "filled": 20}])[0] == 4_950  # bought with coins already locked
+    got, plan = coins([{"order_id": oid, "status": "cancelled", "filled": 20}])
+    assert got == 4_950 + 30 * 101  # the unspent part of an aborted buy comes back
+    (sell,) = acts(plan, "SELL")
+    assert (sell["qty"], sell["price"]) == (20, 109)
+    # The same stale "cash" line left in the file says nothing new: the count stands.
+    assert coins([{"order_id": sell["order_id"], "status": "filling", "filled": 5}], cash=10_000)[0] == 7_980 + 5 * 107
+    got, plan = coins([{"order_id": sell["order_id"], "status": "sold"}])
+    assert got == 7_980 + 20 * 107 == 10_000 + eng.state.realised  # nothing in offers or stock: start + profit
+    assert plan.account["cash_after_actions"] == got - sum(a["price"] * a["qty"] for a in acts(plan, "BUY"))
+    assert "cash" not in plan.reply_template  # copying the template back can never feed in a stale count
+    # A changed figure is a correction, and the answer says by how much.
+    got, plan = coins([], cash=9_000)
+    assert (got, plan.account["cash_correction"]) == (9_000, 9_000 - 10_120)
 
 
 def test_executed_without_a_count_is_a_full_fill():
@@ -268,6 +302,58 @@ def test_free_to_play_status_limits_items_and_slots():
     plan = eng.step(status(1_000_000, members=False), market(prices, T0), T0)
     assert {b["item"] for b in acts(plan, "BUY")} == {"Iron ore", "Salmon"}
     assert plan.account["ge_slots"] == 3 and plan.account["items_allowed"] == "free-to-play"
+
+
+def test_account_settings_stick_and_the_reply_template_is_a_complete_status():
+    eng = engine()
+    prices = {ORE: (100, 110), DEATH: (200, 220), SALMON: (50, 56)}
+    plan = eng.step(status(1_000_000, members=False, inventory_capacity=20), market(prices, T0), T0)
+    tpl = plan.reply_template
+    assert (tpl["members"], tpl["slots"], tpl["inventory_capacity"]) == (False, 3, 20)
+    # Feed the template back exactly as given: nothing about the account is lost.
+    t = T0 + 60
+    plan = eng.step(parse_status(tpl, ITEMS, t), market(prices, t), t)
+    assert (plan.account["ge_slots"], plan.account["items_allowed"], plan.account["inventory_capacity"]) == (3, "free-to-play", 20)
+    # A bare status (cash + orders) keeps them too...
+    t += 60
+    plan = eng.step(status(1_000_000, tpl["orders"], t), market(prices, t), t)
+    assert (plan.account["ge_slots"], plan.account["items_allowed"]) == (3, "free-to-play")
+    assert not any(a["item"] == "Death rune" for a in acts(plan, "BUY"))
+    # ...until a status changes them.
+    t += 60
+    plan = eng.step(status(1_000_000, tpl["orders"], t, members=True, slots=8), market(prices, t), t)
+    assert (plan.account["ge_slots"], plan.account["items_allowed"]) == (8, "all")
+    assert [a["item"] for a in acts(plan, "BUY")] == ["Death rune"]
+
+
+def _with_97k_in_a_buy_offer(**cfg):
+    """An engine whose book already has 97,000 gp locked in one working buy offer."""
+    eng = engine(**cfg)
+    eng.state.orders.append(ExecOrder(id=1, side="buy", item_id=WHIP, name="Abyssal whip", price=97_000, qty=1, issued=T0, state="working", seen=T0, last_progress=T0))
+    eng.state.next_id = 2
+    return eng, [{"order_id": 1, "status": "open"}]
+
+
+def test_small_change_is_not_spread_over_dust_orders():
+    # 3,000 gp loose on a 100k stack with 7 free slots: one order worth having, not seven worth 400 gp each.
+    eng, book = _with_97k_in_a_buy_offer()
+    (buy,) = acts(eng.step(status(3_000, book), market(BOTH, T0), T0), "BUY")
+    assert buy["price"] * buy["qty"] >= 2_000  # at least 2% of equity
+    eng, book = _with_97k_in_a_buy_offer(min_order_frac=0.0)
+    assert len(acts(eng.step(status(3_000, book), market(BOTH, T0), T0), "BUY")) == 2  # the floor is what concentrates it
+    # Too little to make one worthwhile order: wait for coins rather than nibble.
+    eng, book = _with_97k_in_a_buy_offer()
+    plan = eng.step(status(600, book), market(BOTH, T0), T0)
+    assert [a["action"] for a in plan.actions] == ["HOLD"]
+    # An order the market keeps small is not dust: a 100m stack still trades what the volume allows.
+    buys = acts(engine().step(status(100_000_000), market(BOTH, T0), T0), "BUY")
+    assert [(b["item"], b["qty"]) for b in buys] == [("Iron ore", 500), ("Salmon", 500)]  # 5% of 10,000 traded/h, ~0.05% of the stack each
+
+
+def test_no_buy_without_a_chance_of_filling():
+    never = ItemStats(windows=500, fill_buy=0.0, fill_sell=0.5, median_margin=3, volatility_pct=0.5, typical_volume=10_000)
+    plan = engine().step(status(10_000), market(ORE_ONLY, T0, stats={ORE: never}), T0)
+    assert not plan.actions and plan.account["ge_slots_used"] == 0
 
 
 def test_missing_order_is_asked_about_then_assumed_cancelled():

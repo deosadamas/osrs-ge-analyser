@@ -106,6 +106,11 @@ UNKNOWN_MAX_ROI = 0.10
 # accounts through a junk item), not a price level a third party can sell at.
 MARGIN_CAP = 2.0
 
+# Items that cannot be flipped whatever their spread says. A bond bought on the Grand
+# Exchange arrives untradeable; making it tradeable again costs 10% of its price
+# (https://oldschool.runescape.wiki/w/Old_school_bond), far more than any margin.
+NOT_FLIPPABLE = frozenset({"Old school bond"})
+
 
 def ask_for_margin(cost: float, margin: float, name: str = "") -> int:
     """Smallest ask whose after-tax profit over `cost` is at least `margin`."""
@@ -264,7 +269,7 @@ def find_flips(
     out: list[Flip] = []
     for item_id, price in latest.items():
         item = items.get(item_id)
-        if item is None:
+        if item is None or item.name in NOT_FLIPPABLE:
             continue
         if members is not None and item.members != members:
             continue

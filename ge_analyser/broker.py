@@ -231,6 +231,7 @@ class BacktestResult:
     broker: PaperBroker
     pnl_by_item: dict[str, int]
     cancel_reasons: dict[str, int]
+    coin_drift: int = 0  # largest gap between the engine's own coin count and the paper account's coins
 
     @property
     def ret(self) -> float:
@@ -267,7 +268,7 @@ def run_backtest(
     broker = PaperBroker(items, budget, slots=cfg.slots, capacity=cfg.inventory_slots, fill_share=fill_share, strict=strict)
     history: list[Snapshot] = []
     latest: dict[int, LatestPrice] = {}  # last print per item, carried forward like the wiki's /latest
-    steps = first = last = 0
+    steps = first = last = drift = 0
     pnl: dict[str, int] = {}
     cancels: dict[str, int] = {}
     for ts, bucket in windows:
@@ -290,8 +291,12 @@ def run_backtest(
         if active is not None and not active(ts):
             continue  # away from the GE: nothing is collected, cancelled or placed
         status = broker.status(ts)
+        coins = status.cash
+        if steps:
+            status.cash = None  # as in the live loop: coins are stated once, then the engine counts them itself
         market = Market(latest=latest, hour=hour_from_history(history), stats=stats_at(ts) if stats_at else None, used=broker.used(ts))
         plan = engine.step(status, market, ts)
+        drift = max(drift, abs(plan.account["cash"] - coins))
         for f in plan.fills:
             if f.side == "sell":
                 pnl[f.name] = pnl.get(f.name, 0) + f.profit
@@ -302,4 +307,4 @@ def run_backtest(
         broker.apply(plan, snap, ts)
         steps += 1
     span = (last - first) / 3600 + 1 / 12 if first else 0.0
-    return BacktestResult(budget, broker.equity(latest), steps, steps / 12, span, state, broker, pnl, cancels)
+    return BacktestResult(budget, broker.equity(latest), steps, steps / 12, span, state, broker, pnl, cancels, drift)

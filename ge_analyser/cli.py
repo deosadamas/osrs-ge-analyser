@@ -22,6 +22,7 @@ from typing import Callable
 
 from .analysis import (
     MARGIN_CAP,
+    NOT_FLIPPABLE,
     Flip,
     ItemStats,
     find_flips,
@@ -238,7 +239,10 @@ def cmd_item(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
         margin = latest.high - tax - latest.low
         print(f"  Instant-buy:  {fmt_gp(latest.high):>10}  ({_age(now - (latest.high_time or now))} ago)")
         print(f"  Instant-sell: {fmt_gp(latest.low):>10}  ({_age(now - (latest.low_time or now))} ago)")
-        print(f"  Flip margin:  {fmt_gp(margin):>10}  ({margin / latest.low * 100:.2f}% ROI, tax {fmt_gp(tax)})")
+        if item.name in NOT_FLIPPABLE:
+            print("  Not flippable: bought on the GE it arrives untradeable, and converting it back costs 10% of its price.")
+        else:
+            print(f"  Flip margin:  {fmt_gp(margin):>10}  ({margin / latest.low * 100:.2f}% ROI, tax {fmt_gp(tax)})")
     if hour:
         print(f"  Last hour: {hour.high_volume:,} bought @ avg {fmt_gp(hour.avg_high or 0)}, {hour.low_volume:,} sold @ avg {fmt_gp(hour.avg_low or 0)}")
 
@@ -867,7 +871,7 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--reset", action="store_true", help="with --init: discard the existing session")
     x.add_argument("--once", action="store_true", help="answer the current status once and exit")
     x.add_argument("--interval", type=int, default=60, help="seconds between answers when status.json has not changed (default 60)")
-    x.add_argument("--inventory-slots", type=int, default=26, help="item stacks you can hold; collect as notes so each item is one stack (default 26)")
+    x.add_argument("--inventory-slots", type=int, default=26, help="item stacks you can hold; collect as notes so each item is one stack (default 26; a value in status.json wins)")
     x.add_argument("--max-status-age", type=int, default=300, help="warn when status.json is older than this many seconds (default 300)")
     x.add_argument("--margin-cap", type=float, default=MARGIN_CAP, help="plan asks at most this multiple of an item's typical margin over cost; 0 = off (default 2)")
     x.add_argument("--no-margin-cancel", action="store_true", help="keep a buy offer even when the market has moved so it would lose after tax")
@@ -952,9 +956,10 @@ def cmd_tune(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> None
 # ---- execution loop: you trade, the files talk -------------------------------
 
 HOW_TO_REPLY = (
-    "Do the actions top to bottom, then rewrite status.json: your coins, and for every order still in the GE "
+    "Press Collect at the GE, do the actions top to bottom, then rewrite status.json: for every order still in the GE "
     "(or just finished) its order_id, status (open | filling | executed | cancelled) and filled. "
-    "reply_template is that file pre-filled; edit the numbers."
+    "reply_template is that file pre-filled; edit status and filled. Coins are counted for you from what you report: "
+    'add "cash": <your coins> only when account.cash is not what you hold.'
 )
 
 
@@ -1000,10 +1005,13 @@ def _write_json(path: Path, obj, indent: int | None = 2) -> None:
 
 def _print_plan(out: dict) -> None:
     a = out["account"]
+    after = f" (-> {a['cash_after_actions']:,} after these actions)" if a["cash_after_actions"] != a["cash"] else ""
     print(
-        f"--- {out['time'][11:]}  #{out['seq']}  cash {fmt_gp(a['cash'])}  equity ~{fmt_gp(a['equity_est'])}  realised {a['realised']:+,}  "
+        f"--- {out['time'][11:]}  #{out['seq']}  coins {a['cash']:,}{after}  equity ~{fmt_gp(a['equity_est'])}  realised {a['realised']:+,}  "
         f"GE slots {a['ge_slots_used']}/{a['ge_slots']}  stacks {a['inventory_stacks']}/{a['inventory_capacity']}  ({a['items_allowed']}) ---"
     )
+    if a["cash_correction"]:
+        print(f"  coins corrected by {a['cash_correction']:+,}: the engine had counted {a['cash'] - a['cash_correction']:,}")
     rows = []
     for x in out["actions"]:
         rows.append([
@@ -1066,7 +1074,10 @@ def _exec_cycle(args: argparse.Namespace, client: GEClient, ledger: Ledger, engi
     reality = _exec_calibration(args, engine.state, engine.cfg)
     default_scale, item_scales = sizing_scales(reality) if reality else (1.0, {})
     market = Market(latest=latest, hour=hour, stats=timed.at(now) if timed else None, used=ledger.used(now), volume_scale=item_scales, default_scale=default_scale)
-    plan = engine.step(status, market, now)
+    try:
+        plan = engine.step(status, market, now)
+    except StatusError as e:
+        return fail(f"status.json not understood: {e}")
     for f in plan.fills:
         if f.side == "buy":
             ledger.record(f.item_id, f.qty, now, source="exec")
@@ -1093,6 +1104,9 @@ def _exec_report(d: Path) -> None:
     hours = (time.time() - st.start_ts) / 3600 if st.start_ts else 0
     print(f"Session in {d}: {st.seq} cycles over {hours:.1f}h, started with ~{fmt_gp(st.start_equity)}")
     print(f"Realised {st.realised:+,} gp after {fmt_gp(st.tax_paid)} tax; {st.sells} sell fills, {st.wins} profitable")
+    if st.cash_anchor is not None:
+        locked = st.locked()
+        print(f"Coins by the engine's count: {st.cash_anchor + st.flow - locked:,}, plus {locked:,} locked in buy offers")
     if st.orders:
         print("\nOrders on the book:")
         print(_table(
@@ -1162,7 +1176,10 @@ def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
         return f"{best / gains * 100:.0f}% {name}"
 
     def run(c: ExecConfig, share: int):
-        return run_backtest(windows, items, c, budget, start, stats_at, fill_share=share, strict=not args.loose, active=active)
+        r = run_backtest(windows, items, c, budget, start, stats_at, fill_share=share, strict=not args.loose, active=active)
+        if r.coin_drift:  # the engine counts coins itself, as in the live loop; the paper account knows the truth
+            print(f"  ! the engine's coin count was off by up to {r.coin_drift:,} gp against the paper account in this run")
+        return r
 
     def row(label: str, r) -> list[str]:
         st = r.state
