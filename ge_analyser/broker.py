@@ -219,12 +219,14 @@ class PaperBroker:
 # phrase in a CANCEL's "why" -> short label, for backtest reports
 CANCEL_KINDS = {"margin gone": "margin gone", "no fill": "buy timeout", "unsold for": "dump", "no sale": "reprice"}
 
+
 @dataclass
 class BacktestResult:
     start_cash: int
     equity: int
-    steps: int
-    hours: float
+    steps: int  # cycles in which you were at the GE
+    hours: float  # hours at the GE (steps x 5 min)
+    span_hours: float  # length of the replay
     state: ExecState
     broker: PaperBroker
     pnl_by_item: dict[str, int]
@@ -236,7 +238,13 @@ class BacktestResult:
 
     @property
     def actions_per_hour(self) -> float:
+        """Offers placed or aborted per hour at the GE."""
         return sum(self.broker.placed.values()) / self.hours if self.hours else 0.0
+
+    @property
+    def profit_per_hour(self) -> float:
+        """gp gained per hour at the GE."""
+        return (self.equity - self.start_cash) / self.hours if self.hours else 0.0
 
 
 def run_backtest(
@@ -248,9 +256,12 @@ def run_backtest(
     stats_at: Callable[[int], dict[int, ItemStats]] | None = None,
     fill_share: int = 10,
     strict: bool = True,
+    active: Callable[[int], bool] | None = None,
 ) -> BacktestResult:
     """Replay 5m windows through the execution engine and a paper broker. Windows before
-    `start` only warm up the hourly volume; the same engine code runs as in the live loop."""
+    `start` only warm up the hourly volume; the same engine code runs as in the live loop.
+    `active(ts)` says whether you are at the GE in that window; when you are not, offers
+    keep filling but nothing is collected, cancelled or placed."""
     state = ExecState()
     engine = Executor(state, items, cfg)
     broker = PaperBroker(items, budget, slots=cfg.slots, capacity=cfg.inventory_slots, fill_share=fill_share, strict=strict)
@@ -273,7 +284,11 @@ def run_backtest(
             )
         if ts < start:
             continue
-        broker.process_fills(snap, ts)
+        broker.process_fills(snap, ts)  # the market fills your offers whether you are there or not
+        last = ts
+        first = first or ts
+        if active is not None and not active(ts):
+            continue  # away from the GE: nothing is collected, cancelled or placed
         status = broker.status(ts)
         market = Market(latest=latest, hour=hour_from_history(history), stats=stats_at(ts) if stats_at else None, used=broker.used(ts))
         plan = engine.step(status, market, ts)
@@ -286,7 +301,5 @@ def run_backtest(
                 cancels[CANCEL_KINDS.get(reason, "other")] = cancels.get(CANCEL_KINDS.get(reason, "other"), 0) + 1
         broker.apply(plan, snap, ts)
         steps += 1
-        first = first or ts
-        last = ts
-    hours = (last - first) / 3600 + 1 / 12 if steps else 0.0
-    return BacktestResult(budget, broker.equity(latest), steps, hours, state, broker, pnl, cancels)
+    span = (last - first) / 3600 + 1 / 12 if first else 0.0
+    return BacktestResult(budget, broker.equity(latest), steps, steps / 12, span, state, broker, pnl, cancels)

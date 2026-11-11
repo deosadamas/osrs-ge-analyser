@@ -874,6 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--volume-frac", type=float, default=None, help="size each order to this share of hourly volume (default: buy timeout / fill share = 0.05)")
     x.add_argument("--backtest", type=float, metavar="HOURS", help="replay the last N hours through the same engine with a paper broker")
     x.add_argument("--compare", action="store_true", help="backtest: show how the result depends on the share of volume you get, the inventory limit and the old simulator")
+    x.add_argument("--play", metavar="START-END", help="backtest: local hours you are at the GE each day, e.g. 19-23 (default: around the clock)")
     x.add_argument("--report", action="store_true", help="session so far: profit, orders, stock, real fills vs the model")
     x.set_defaults(func=cmd_execute)
 
@@ -1114,6 +1115,24 @@ def _exec_report(d: Path) -> None:
         print(f"Real fills vs the paper model on {reality.orders} measured buy orders: {ratio} (1.00 = backtests are right; below = they overstate)")
 
 
+def _play_schedule(spec: str | None):
+    """--play START-END in local hours -> (predicate or None, description)."""
+    if not spec:
+        return None, "at the GE around the clock"
+    try:
+        a, b = (int(x) for x in spec.split("-"))
+        if not (0 <= a < 24 and 0 < b <= 24) or a == b:
+            raise ValueError
+    except ValueError:
+        sys.exit("--play takes local hours as START-END, e.g. 19-23")
+
+    def active(ts: int) -> bool:
+        h = time.localtime(ts).tm_hour
+        return a <= h < b if a < b else (h >= a or h < b)
+
+    return active, f"at the GE {a:02d}:00-{b % 24:02d}:00 local ({(b - a) % 24} h a day)"
+
+
 def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
     items = client.mapping()
     cfg = _exec_config(args)
@@ -1132,7 +1151,8 @@ def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
     windows = list(store.windows(start - 3600, end + 1))
     span = f"{time.strftime('%m-%d %H:%M', time.localtime(start))} to {time.strftime('%m-%d %H:%M', time.localtime(end))}"
     who = "free-to-play items" if cfg.members is False else "all items"
-    print(f"Execution backtest: {args.backtest:g}h ({span}), {who}, start {fmt_gp(budget)}, {cfg.slots} GE slots, {cfg.inventory_slots} inventory stacks")
+    active, presence = _play_schedule(args.play)
+    print(f"Execution backtest: {args.backtest:g}h ({span}), {who}, start {fmt_gp(budget)}, {cfg.slots} GE slots, {cfg.inventory_slots} inventory stacks, {presence}")
 
     def top_share(pnl: dict[str, int]) -> str:
         gains = sum(v for v in pnl.values() if v > 0)
@@ -1141,38 +1161,44 @@ def _exec_backtest(args: argparse.Namespace, client: GEClient) -> None:
         name, best = max(pnl.items(), key=lambda kv: kv[1])
         return f"{best / gains * 100:.0f}% {name}"
 
+    def run(c: ExecConfig, share: int):
+        return run_backtest(windows, items, c, budget, start, stats_at, fill_share=share, strict=not args.loose, active=active)
+
     def row(label: str, r) -> list[str]:
         st = r.state
         return [
-            label, fmt_gp(r.equity), f"{r.ret * 100:+.0f}%", str(st.sells), f"{st.wins / st.sells * 100:.0f}%" if st.sells else "-",
+            label, fmt_gp(r.equity), f"{r.ret * 100:+.0f}%", fmt_gp(r.profit_per_hour), str(st.sells), f"{st.wins / st.sells * 100:.0f}%" if st.sells else "-",
             f"{r.actions_per_hour:.0f}", str(r.broker.max_stacks), top_share(r.pnl_by_item),
         ]
 
-    headers = ["Model", "Equity", "Return", "Sells", "Win", "Clicks/h", "Max stacks", "Biggest winner"]
+    headers = ["Model", "Equity", "Return", "gp/h at GE", "Sells", "Win", "Clicks/h", "Max stacks", "Biggest winner"]
+    right = {1, 2, 3, 4, 5, 6, 7}
     if args.compare:
         rows = []
         for share in (10, 30, 100):
-            c = replace(cfg, fill_share=share)
-            rows.append(row(f"engine, you get 1/{share} of crossing volume", run_backtest(windows, items, c, budget, start, stats_at, fill_share=share, strict=not args.loose)))
-        c = replace(cfg, inventory_slots=10**6)
-        rows.append(row("engine, 1/10, unlimited inventory", run_backtest(windows, items, c, budget, start, stats_at, fill_share=10, strict=not args.loose)))
-        legacy = Config(slots=cfg.slots, min_volume=cfg.min_volume, max_age=cfg.max_age, members=cfg.members, strict=not args.loose, min_margin=cfg.min_margin, min_roi=cfg.min_roi, improve=cfg.improve)
-        state, snap, _ = replay(windows, items, legacy, budget, start, stats_at)
-        by: dict[str, int] = {}
-        for t in state.trades:
-            if t.kind == "sell":
-                by[t.name] = by.get(t.name, 0) + t.profit
-        sells = [t for t in state.trades if t.kind == "sell"]
-        eq = state.equity(snap)
-        rows.append(["legacy simulator, 1/10 (sells need no slot)", fmt_gp(eq), f"{(eq / budget - 1) * 100:+.0f}%", str(len(sells)), f"{sum(t.profit > 0 for t in sells) / len(sells) * 100:.0f}%" if sells else "-", "-", "-", top_share(by)])
+            rows.append(row(f"engine, you get 1/{share} of crossing volume", run(replace(cfg, fill_share=share), share)))
+        rows.append(row("engine, 1/10, unlimited inventory", run(replace(cfg, inventory_slots=10**6), 10)))
+        if active is None:
+            legacy = Config(slots=cfg.slots, min_volume=cfg.min_volume, max_age=cfg.max_age, members=cfg.members, strict=not args.loose, min_margin=cfg.min_margin, min_roi=cfg.min_roi, improve=cfg.improve)
+            state, snap, _ = replay(windows, items, legacy, budget, start, stats_at)
+            by: dict[str, int] = {}
+            for t in state.trades:
+                if t.kind == "sell":
+                    by[t.name] = by.get(t.name, 0) + t.profit
+            sells = [t for t in state.trades if t.kind == "sell"]
+            eq = state.equity(snap)
+            rows.append([
+                "old simulator, 1/10 (sells need no slot)", fmt_gp(eq), f"{(eq / budget - 1) * 100:+.0f}%", fmt_gp((eq - budget) / args.backtest), str(len(sells)),
+                f"{sum(t.profit > 0 for t in sells) / len(sells) * 100:.0f}%" if sells else "-", "-", "-", top_share(by),
+            ])
         print()
-        print(_table(headers, rows, right={1, 2, 3, 4, 5, 6}))
+        print(_table(headers, rows, right=right))
         print("\nThe share of volume you really get is the unknown; `execute --report` measures it from your own fills.")
         return
 
-    r = run_backtest(windows, items, cfg, budget, start, stats_at, fill_share=cfg.fill_share, strict=not args.loose)
+    r = run(cfg, cfg.fill_share)
     print()
-    print(_table(headers, [row(f"engine, 1/{cfg.fill_share} of crossing volume", r)], right={1, 2, 3, 4, 5, 6}))
+    print(_table(headers, [row(f"engine, 1/{cfg.fill_share} of crossing volume", r)], right=right))
     b = r.broker
     print(f"\nPlaced {b.placed['buy']} buys, {b.placed['sell']} sells, {b.placed['cancel']} cancels; never more than {b.max_offers} offers and {b.max_stacks} stacks at once; "
           f"{b.rejected} instructions could not be carried out, {b.blocked} collections blocked by a full inventory.")

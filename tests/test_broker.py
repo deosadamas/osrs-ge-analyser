@@ -96,6 +96,20 @@ def test_engine_and_broker_round_trip_respects_every_limit():
     assert abs(r.equity - (10_000 + r.state.realised + stock)) <= 110 * len(r.state.positions) + 1
 
 
+def test_offers_keep_filling_while_you_are_away_but_nothing_is_managed():
+    windows = [
+        (T0 + k * 300, {ORE: {"avgHighPrice": 110 + k % 2, "highPriceVolume": 4000, "avgLowPrice": 100 - k % 2, "lowPriceVolume": 4000}})
+        for k in range(120)
+    ]
+    cfg = ExecConfig(slots=3, inventory_slots=2, max_age=600)
+    always = run_backtest(windows, ITEMS, cfg, 10_000, start=T0 + 12 * 300)
+    hourly = run_backtest(windows, ITEMS, cfg, 10_000, start=T0 + 12 * 300, active=lambda ts: ((ts - T0) // 300) % 12 == 0)
+    assert (hourly.steps, hourly.hours) == (9, 0.75) and hourly.span_hours == always.span_hours == 9.0
+    assert 0 < hourly.state.realised < always.state.realised  # a look once an hour still trades, just less
+    assert hourly.broker.rejected == 0 and hourly.broker.blocked == 0
+    assert hourly.profit_per_hour == (hourly.equity - 10_000) / 0.75  # measured per hour actually spent at the GE
+
+
 def test_model_fill_weights_windows_by_how_long_the_order_was_live():
     rows = [
         (T0, 110, 500, 99, 1000),  # live for the last 150 s of this window
