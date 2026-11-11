@@ -1060,7 +1060,7 @@ def _exec_cycle(args: argparse.Namespace, client: GEClient, ledger: Ledger, engi
         print(f"--- {stamp[11:]}  {message}", flush=True)
 
     if not status_path.exists():
-        return fail(f"no {status_path}: run `ge-analyser execute --init --cash <coins>` or write the file yourself")
+        return fail(f"no {status_path} yet: log in with the RuneLite plugin running, or run `ge-analyser execute --init --cash <coins>`")
     try:
         status = parse_status(_read_json(status_path), items, int(status_path.stat().st_mtime))
     except (json.JSONDecodeError, UnicodeDecodeError, StatusError) as e:
@@ -1077,7 +1077,7 @@ def _exec_cycle(args: argparse.Namespace, client: GEClient, ledger: Ledger, engi
     try:
         plan = engine.step(status, market, now)
     except StatusError as e:
-        return fail(f"status.json not understood: {e}")
+        return fail(f"status.json not used: {e}")
     for f in plan.fills:
         if f.side == "buy":
             ledger.record(f.item_id, f.qty, now, source="exec")
