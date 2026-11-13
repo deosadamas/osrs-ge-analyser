@@ -375,14 +375,15 @@ ge-analyser execute --backtest 168 --budget 1m --play 19-23  # at the GE 19:00-2
 `--backtest` replays history through the **same engine** with a paper broker that obeys
 GE mechanics: coins reserved, slots shared, Collect once per cycle, 26 stacks. The
 engine counts its own coins as in the live loop and the broker checks the count: in the
-713 week-long runs behind this page it was never off by a coin, and the engine never
+741 week-long runs behind this page it was never off by a coin, and the engine never
 asked for an offer that could not be placed. What it showed:
 
 1. **One freak print carried the old results.** During the first live paper run a junk
    item (Steel knife(p+)) printed ~5,500 units at 49,999 gp in 20 minutes — almost
    certainly coins being moved between two accounts. The paper agent "bought at 501 and
-   sold at 49,998"; that single trade was 7.8m of its 8.9m profit (87%). Items without
-   history are now never traded, and asks are capped at twice the usual margin.
+   sold at 49,998"; that single trade was 7.8m of its 8.9m profit (87%) — both figures
+   too high, because that loop also counted fills more than once (finding 6). Items
+   without history are now never traded, and asks are capped at twice the usual margin.
 2. **Bonds were the "best flip" for a big stack.** With 10m or more to spend, up to 91%
    of the backtest profit came from Old school bonds, which cannot be flipped at all.
    They are excluded.
@@ -401,9 +402,10 @@ asked for an offer that could not be placed. What it showed:
 
    Against the earlier settings in the same weeks, started with 10k and with 1m: 112%
    and 132% at N = 10, 119% and 126% at N = 30, 145% and 172% at N = 100; free-to-play
-   106% (84–120%) at N = 30. At worst one item was a third of a week's profit at
-   N = 30 (Ascension shards, week of Oct 21) and 40% at N = 10; with 1m or more at
-   N = 100 Chaos runes were up to half, and free-to-play Gold bars up to 46%.
+   97% (70–110%) at N = 10 and 106% (84–120%) at N = 30. At worst one item was a third
+   of a week's profit at N = 30 (Ascension shards, week of Oct 21) and 40% at N = 10;
+   with 1m or more at N = 100 Chaos runes were up to half, and free-to-play Gold bars
+   up to 46%.
 4. **Profit is capped by market flow, not by your stack.** Orders are sized to what an
    item really trades, so from about 1m up a bigger stack earns the same gp: 100m makes
    exactly what 10m makes. Admitting thinner, pricier items (`--min-volume 10`) did not
@@ -414,11 +416,18 @@ asked for an offer that could not be placed. What it showed:
    hours a day (`--play 19-23`, N = 30) keeps 31% of the weekly profit for a 1m stack,
    because offers fill while you are away (+391k a week from 54 offers a day, 14k gp per
    hour at the GE); a 10k stack keeps 8% (+62k), having lost its compounding.
-6. **Real mechanics cost 12–26% against the old simulator** on the same data and N.
-   That was measured with the earlier settings, whose 30-minute patience the old
-   simulator shares (+1.50m vs +1.71m from 10k, +2.24m vs +3.01m from 1m, week of Nov 3;
-   nothing with 3 free-to-play slots). The 26-stack limit never binds: at most 8 stacks
-   were ever held.
+6. **What the GE's mechanics cost has not been measured; the figure given here before
+   is withdrawn.** An earlier version of this page said real mechanics cost 12–26%,
+   from the engine against the older simulator in one week: +1.50m against +1.71m
+   from 10k, +2.24m against +3.01m from 1m. That simulator paid every fill twice (see
+   "Paper-trading agent" below). Corrected, over the same four weeks at N = 10, it
+   makes +1.04m a week from 10k and +1.17m from 1m, and the engine with its earlier
+   settings +1.64m and +2.48m: more than the simulator in each of the eight weeks, by
+   23% at least. With 3 free-to-play slots they are level (+132k and +138k). The two
+   differ in more than slots and Collect — how big an order is, when bought stock goes
+   on sale, when a bid is given up — so the gap between them measures no single thing,
+   in either direction. What is measured: the 26-stack limit never binds; at most 8
+   stacks were ever held.
 
 What no backtest can know is N. The loop measures it from your own fills and
 `execute --report` prints it: see "The share of volume it assumes you get" above.
@@ -451,6 +460,21 @@ listed for sale instantly and its sell offer does not need a free slot, every cr
 window fills at least one unit, and there is no inventory limit. It shares the engine's
 guards (no history → no trade; asks capped at twice the usual margin).
 
+**Until it was corrected it counted fills more than once.** Its step ran the fill pass
+twice, so a backtest paid out every crossing window twice. And a live loop that looks
+more often than the wiki's 5-minute volume window changes took a fresh tenth of the
+same window at every look: the two paper agents kept here looked every 60 seconds, and
+in two days from 10k showed +520k (8 slots) and +74k (free-to-play), where a replay of
+the same hours through the corrected simulator gives +115k and +11k. (Not all of that
+gap is the over-count: a replay sees 5-minute averages, the live loop single trades.)
+An offer now takes its share of a window once, and only for the part of the window it
+was in the book; the `--events` log names the window of every fill, so a run can be
+checked against the market. With 8 slots a backtest now makes about half of what it
+did: over four weeks at N = 10 and `--min-volume 200`, +1.04m a week from 10k instead
+of +1.93m and +1.17m from 1m instead of +2.59m; with 3 free-to-play slots, +138k
+instead of +161k. The first live paper run, the one with the freak print, was counted
+the same way.
+
 ```sh
 # Replay the last 24h of 5-minute history with a 10k start (results in seconds)
 ge-analyser simulate --budget 10k --backtest 24
@@ -464,12 +488,13 @@ ge-analyser simulate --reset      # start over
 Strategy: for each free slot, take the best-scoring flip the ranking produces with
 `budget = cash / free_slots`, bid **1 gp above** the current instant-sell and, once
 filled, ask **1 gp below** the instant-buy seen at fill time — you are then the best
-offer on each side rather than one of many at the print (`--no-improve` quotes the
-exact prints; in this paper model that is 2.8× worse over the same 96 h, +2,135% vs
-6,055%). Buys are cancelled after 30 min unfilled; sells are re-priced to the current
-instant-buy after 30 min and dumped at instant-sell after 90 min so nothing sits
-forever. `--min-stake N` concentrates a small stack into fewer slots (neutral in
-backtests; off by default).
+offer on each side rather than one of many at the print. `--no-improve` quotes the
+exact prints instead: over four weeks from 10k that made 55% of the profit (32–96% by
+week; +537k a week against +980k), and 47% (41–52%) in the execution engine. Buys are
+cancelled after 30 min unfilled; sells are re-priced to the current instant-buy after
+30 min and dumped at instant-sell after 90 min so nothing sits forever. `--min-stake N`
+concentrates a small stack into fewer slots (off by default; `--min-stake 2500` made
+104% of the default's profit over those weeks, 95–119%, which is inside the noise).
 
 `ge-analyser tune` runs a walk-forward sweep of the scoring constants (liquidity weight,
 volatility penalty, bucket shrinkage) over several past windows, ranks candidates on the
@@ -485,7 +510,7 @@ Fill model (conservative by default, tunable):
 | Rule | Flag |
 |------|------|
 | A buy fills only when a later print's instant-sell goes **below** our bid; a sell only when instant-buy goes **above** our ask (price-time priority: at a touched price you're queued behind everyone already there). | `--loose` to fill on touch (very optimistic) |
-| Each print fills at most 1/N of that window's one-sided volume. | `--fill-share N` (default 10 here; `execute` assumes 30) |
+| An offer gets at most 1/N of the volume traded on its side in each 5-minute window: once per window however often the loop looks, and only for the part of the window it was in the book. | `--fill-share N` (default 10 here; `execute` assumes 30) |
 | Fills happen at our offer price, never the better print. | — |
 | Only enter flips with ≥ 2 gp and ≥ 2% margin after tax; 1-gp spreads on bot items aren't real money for a solo flipper. | `--min-margin`, `--min-roi` |
 
@@ -596,12 +621,16 @@ Score: `Expect = min(margin, Typ) × Qty × Fill`, then
 Without history (`--no-stats`) the legacy score is `profit × staleness × liquidity`.
 
 Does it help? `simulate --backtest H --compare` runs time-of-week features, flat
-features and no history side by side. An earlier version of this page quoted a 3.5×
-edge over a week from that comparison; it is withdrawn. Re-run on the current model the
-three variants are within 5% of each other over 72 h (+3,106% / +2,942% / +3,063%) and
-the no-history variant cannot be compared fairly at all, because without history it has
-no protection against freak prints and a week containing one decides its result. What
-history demonstrably buys is that protection — the engines refuse to trade without it.
+features and no history side by side. Over four weeks from 10k (N = 10, the corrected
+simulator): time-of-week features +980k a week, flat features +922k (91–101% of it by
+week, which is inside the noise), no history +571k (33–82%). So history is worth
+having, and the time of week adds nothing these four weeks can show. Two earlier
+versions of this page gave other answers — a 3.5× edge for time-of-week features over one
+week, then all three within 5% of each other over 72 h. Both came from the simulator
+while it still counted fills twice, and both are withdrawn. Without history there is
+also no protection against freak prints, which is why the engines refuse to trade
+without it. A freak print would flatter the no-history figure; in these four weeks
+nothing did: it made less in every one.
 
 ## Caching
 

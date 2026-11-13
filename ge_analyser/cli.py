@@ -848,7 +848,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--loose", action="store_true", help="fill when the market touches our price instead of crossing it (optimistic)")
         sp.add_argument("--min-margin", type=int, default=2, help="min per-unit profit after tax to enter a flip")
         sp.add_argument("--min-roi", type=float, default=2.0, help="min ROI percent to enter a flip")
-        sp.add_argument("--no-improve", action="store_true", help="bid/ask exactly at the instant prices instead of 1 gp better (4x worse in backtests)")
+        sp.add_argument("--no-improve", action="store_true", help="bid/ask exactly at the instant prices instead of 1 gp better (about half the profit in backtests)")
         sp.add_argument("--min-stake", default="0", help="gp per slot; use fewer slots until equity supports this many, e.g. 2500 (default off)")
         g = sp.add_mutually_exclusive_group()
         g.add_argument("--f2p", action="store_true", help="free-to-play items only")
