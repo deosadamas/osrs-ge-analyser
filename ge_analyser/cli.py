@@ -391,7 +391,8 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
     state = State.load(path) if path.exists() else State(start_cash=parse_gp(args.budget), cash=parse_gp(args.budget))
     sim = Simulator(state, items, cfg)
     if args.status:
-        snap = snapshot_from_live(client.latest(), client.window("5m"))
+        start5, five = client.latest_window("5m")
+        snap = snapshot_from_live(client.latest(), five, start5)
         _print_sim(state, snap, int(time.time()))
         return
 
@@ -407,8 +408,8 @@ def cmd_simulate(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> 
     while args.ticks == 0 or n < args.ticks:
         now = int(time.time())
         try:
-            latest, five, hour = client.latest(), client.window("5m"), client.hourly()
-            snap = snapshot_from_live(latest, five)
+            latest, (start5, five), hour = client.latest(), client.latest_window("5m"), client.hourly()
+            snap = snapshot_from_live(latest, five, start5)
             timed = _timed_stats(args, client, items, now)
         except (OSError, ValueError, KeyError) as e:
             # Wiki hiccup (closed connection, timeout, bad JSON): skip this tick, keep state.
@@ -655,7 +656,8 @@ def cmd_advise(args: argparse.Namespace, client: GEClient, ledger: Ledger) -> No
                 if not sim_path.exists():
                     sys.exit(f"No agent state at {sim_path}; start `ge-analyser simulate --ticks 0` first.")
                 state = State.load(sim_path)
-                payload = _agent_payload(state, items, ledger, now, snapshot_from_live(latest, client.window("5m")))
+                start5, five = client.latest_window("5m")
+                payload = _agent_payload(state, items, ledger, now, snapshot_from_live(latest, five, start5))
                 flips = payload["flips"]
             else:
                 hour = client.hourly()

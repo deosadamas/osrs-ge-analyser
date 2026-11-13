@@ -113,12 +113,19 @@ class GEClient:
             for item_id, row in raw.items()
         }
 
-    def window(self, step: str) -> dict[int, WindowPrice]:
-        """step: '5m' or '1h'. Returns the most recent completed window."""
+    def _window(self, step: str) -> dict[str, Any]:
         if step not in ("5m", "1h"):
             raise ValueError("step must be '5m' or '1h'")
-        raw = self._get(step)["data"]
-        return {int(item_id): window_price(row) for item_id, row in raw.items()}
+        return self._get(step)
+
+    def window(self, step: str) -> dict[int, WindowPrice]:
+        """step: '5m' or '1h'. Returns the most recent completed window."""
+        return {int(item_id): window_price(row) for item_id, row in self._window(step)["data"].items()}
+
+    def latest_window(self, step: str) -> tuple[int, dict[int, WindowPrice]]:
+        """The same window together with the time it starts, from one response."""
+        raw = self._window(step)
+        return int(raw["timestamp"]), {int(item_id): window_price(row) for item_id, row in raw["data"].items()}
 
     def hourly(self) -> dict[int, WindowPrice]:
         """Hourly volume robust to feed gaps.

@@ -115,7 +115,9 @@ Sells are listed first because they free slots. The header shows the agent's equ
 realised P&L. Anything you have open that is not on the list is something the agent has
 cancelled. For a machine-readable stream of the agent's decisions run it with
 `simulate --ticks 0 --events ~/.osrs-ge-analyser/agent-events.jsonl`: one JSON line per
-`offer` / `fill` / `cancel` / `reprice` / `dump` with item, qty, price and side.
+`offer` / `fill` / `cancel` / `reprice` / `dump` with item, qty, price and side. A `fill`
+also gives `window`, the start of the 5-minute window whose volume it took its share of
+(at most one fill per offer and window).
 
 The advice file lives at `~/.osrs-ge-analyser/advice.json` (configurable in the plugin
 settings). Your offers are appended to `~/.osrs-ge-analyser/runelite-trades.jsonl`, which

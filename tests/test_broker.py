@@ -16,7 +16,7 @@ def plan(*actions):
 
 
 def tick(ts, low=None, high=None, low_vol=0, high_vol=0):
-    return {ORE: Tick(high, ts, low, ts, high_vol, low_vol)}
+    return {ORE: Tick(high, ts, low, ts, high_vol, low_vol, window=ts)}
 
 
 def test_buy_reserves_coins_fills_only_when_crossed_and_in_proportion_to_flow():

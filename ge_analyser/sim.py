@@ -6,8 +6,10 @@ Fill model (deliberately conservative):
   below P (strict, default) or touches P (`--loose`). Sells mirror this on the
   instant-buy price. Strict models price-time priority: at a touched price you are
   queued behind everyone already offering there.
-- Each print can fill at most 1/`fill_share` (default 1/10) of that window's one-sided
-  volume, and fills happen at our own offer price, never the better print.
+- An offer gets at most 1/`fill_share` (default 1/10) of the volume traded on its side
+  in each 5-minute window: only the part of the window after the offer was placed
+  counts, and a window is shared out once however often it is looked at. Fills happen
+  at our own offer price, never the better print.
 - Cash is reserved when a buy is placed (as the real GE does) and returned on cancel.
 - GE tax is charged on sells. Buy limits and GE slot count are enforced.
 - Unfilled buys are cancelled after `buy_timeout`. Unfilled sells are re-priced to the
@@ -26,9 +28,12 @@ from .analysis import DEFAULT_PARAMS, MARGIN_CAP, Flip, ItemStats, ScoreParams, 
 from .api import ItemInfo, LatestPrice, WindowPrice
 
 
+WINDOW_S = 300  # the wiki's volume windows are five minutes long
+
+
 @dataclass(frozen=True)
 class Tick:
-    """One market print for one item."""
+    """One market print for one item, and the 5-minute window its volumes were traded in."""
 
     high: int | None
     high_time: int
@@ -36,6 +41,7 @@ class Tick:
     low_time: int
     high_volume: int
     low_volume: int
+    window: int  # when that window starts
 
 
 Snapshot = dict[int, Tick]
@@ -54,6 +60,7 @@ class Order:
     cost_basis: int = 0  # per-unit buy price, sells only
     repriced: bool = False
     target: int = 0  # buys only: the ask we intend to list at once filled
+    last_window: int = 0  # start of the last 5-minute window this offer took its share of
 
     @property
     def remaining(self) -> int:
@@ -81,7 +88,7 @@ class Config:
     min_volume: int = 50
     max_age: int = 3600
     members: bool | None = None
-    fill_share: int = 10  # we capture 1/fill_share of a window's one-sided volume per print
+    fill_share: int = 10  # an offer gets 1/fill_share of each 5-minute window's volume on its side
     strict: bool = True  # fills need the market to cross our price, not just touch it
     min_margin: int = 2  # gp per unit after tax; 1-gp spreads are bot territory
     min_roi: float = 0.02
@@ -213,15 +220,28 @@ class Simulator:
             else:
                 self._fill_sell(o, tick, now)
 
+    def _share(self, o: Order, tick: Tick, volume: int) -> int:
+        """Units `o` gets from the tick's 5-minute window: 1/fill_share of the `volume`
+        traded on its side, counting only the part of the window after the offer was
+        placed, and at least one unit. A window is shared out once: a live loop that
+        looks every minute sees the same window several times."""
+        if tick.window <= o.last_window:
+            return 0
+        live = min(tick.window + WINDOW_S - o.placed, WINDOW_S)  # seconds of the window the offer was in the book
+        if live <= 0:
+            return 0
+        return min(o.remaining, max(volume * live // (WINDOW_S * self.cfg.fill_share), 1))
+
     def _fill_buy(self, o: Order, tick: Tick, now: int) -> None:
         if tick.low is None or tick.low_time <= o.placed:
             return
         if tick.low >= o.price if self.cfg.strict else tick.low > o.price:
             return
-        qty = min(o.remaining, max(tick.low_volume // self.cfg.fill_share, 1))
+        qty = self._share(o, tick, tick.low_volume)
         if qty <= 0:
             return
         o.filled += qty
+        o.last_window = tick.window
         # Fill at our own bid; ignore the GE's occasional better-price refund (conservative).
         price = o.price
         self.state.trades.append(Trade(now, "buy", o.item_id, o.name, qty, price, 0, 0))
@@ -231,7 +251,7 @@ class Simulator:
         ask = self._capped(o.item_id, o.name, ask, price, now)
         self._list_for_sale(self.items[o.item_id], qty, price, ask, now)
         self._log(now, f"BUY  {qty:,} x {o.name} @ {price:,} -> listing @ {ask:,}")
-        self._event(now, "fill", self.items[o.item_id], qty, price, side="buy", ask=ask)
+        self._event(now, "fill", self.items[o.item_id], qty, price, side="buy", ask=ask, window=tick.window)
         if o.remaining == 0:
             self.state.orders.remove(o)
 
@@ -252,11 +272,13 @@ class Simulator:
             return
         if tick.high <= o.price if self.cfg.strict else tick.high < o.price:
             return
-        qty = min(o.remaining, max(tick.high_volume // self.cfg.fill_share, 1))
+        qty = self._share(o, tick, tick.high_volume)
         if qty > 0:
-            self._execute_sell(o, o.price, qty, now)  # fill at our own ask (conservative)
+            o.last_window = tick.window
+            self._execute_sell(o, o.price, qty, now, window=tick.window)  # fill at our own ask (conservative)
 
-    def _execute_sell(self, o: Order, price: int, qty: int, now: int) -> None:
+    def _execute_sell(self, o: Order, price: int, qty: int, now: int, window: int | None = None) -> None:
+        """Book a sale. `window` is the 5-minute window whose volume it took a share of; a dump has none."""
         tax = ge_tax(price, o.name)
         proceeds = (price - tax) * qty
         profit = proceeds - o.cost_basis * qty
@@ -264,7 +286,7 @@ class Simulator:
         self.state.cash += proceeds
         self.state.trades.append(Trade(now, "sell", o.item_id, o.name, qty, price, tax * qty, profit))
         self._log(now, f"SELL {qty:,} x {o.name} @ {price:,} (tax {tax * qty:,}) profit {profit:+,}")
-        self._event(now, "fill", self.items[o.item_id], qty, price, side="sell", profit=profit)
+        self._event(now, "fill", self.items[o.item_id], qty, price, side="sell", profit=profit, window=window)
         if o.remaining == 0:
             self.state.orders.remove(o)
 
@@ -345,8 +367,7 @@ class Simulator:
     # ---- one full step -------------------------------------------------
     def step(self, snapshot: Snapshot, latest: dict[int, LatestPrice], hour: dict[int, WindowPrice], now: int) -> None:
         self.process_fills(snapshot, now)
-        self.expire(snapshot, now)
-        self.process_fills(snapshot, now)  # dumps fill immediately on the same print
+        self.expire(snapshot, now)  # a dump is sold inside expire; a repriced offer waits for the next look
         self.decide(latest, hour, now)
         self.state.ticks += 1
         self.state.last_tick = now
@@ -355,7 +376,8 @@ class Simulator:
 # ---- snapshot construction ------------------------------------------------
 
 
-def snapshot_from_live(latest: dict[int, LatestPrice], window: dict[int, WindowPrice]) -> Snapshot:
+def snapshot_from_live(latest: dict[int, LatestPrice], window: dict[int, WindowPrice], window_start: int) -> Snapshot:
+    """The latest prints, with the volumes of the 5-minute window that starts at `window_start`."""
     out: Snapshot = {}
     for item_id, p in latest.items():
         w = window.get(item_id)
@@ -366,12 +388,13 @@ def snapshot_from_live(latest: dict[int, LatestPrice], window: dict[int, WindowP
             low_time=p.low_time or 0,
             high_volume=w.high_volume if w else 0,
             low_volume=w.low_volume if w else 0,
+            window=window_start,
         )
     return out
 
 
 def snapshot_from_buckets(buckets: dict[int, dict], ts: int) -> Snapshot:
-    """Build a snapshot from per-item 5m timeseries buckets for one timestamp."""
+    """Build a snapshot from per-item 5m timeseries buckets for the window starting at `ts`."""
     out: Snapshot = {}
     for item_id, b in buckets.items():
         out[item_id] = Tick(
@@ -381,6 +404,7 @@ def snapshot_from_buckets(buckets: dict[int, dict], ts: int) -> Snapshot:
             low_time=ts,
             high_volume=b.get("highPriceVolume") or 0,
             low_volume=b.get("lowPriceVolume") or 0,
+            window=ts,
         )
     return out
 
